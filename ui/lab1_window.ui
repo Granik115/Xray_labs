@@ -1,0 +1,314 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>Lab1Window</class>
+ <widget class="QMainWindow" name="Lab1Window">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1020</width>
+    <height>620</height>
+   </rect>
+  </property>
+  <property name="minimumSize">
+   <size>
+    <width>900</width>
+    <height>560</height>
+   </size>
+  </property>
+  <property name="windowTitle">
+   <string>Л/р 1. Оценка концентрации вещества рентгеноабсорбционным методом</string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QHBoxLayout" name="mainHorizontal">
+    <property name="spacing">
+     <number>8</number>
+    </property>
+    <property name="leftMargin">
+     <number>8</number>
+    </property>
+    <property name="topMargin">
+     <number>8</number>
+    </property>
+    <property name="rightMargin">
+     <number>8</number>
+    </property>
+    <property name="bottomMargin">
+     <number>8</number>
+    </property>
+    <!-- LEFT CONTROLS PANEL (dark blue like mocks) -->
+    <item>
+     <widget class="QFrame" name="leftPanel">
+      <property name="minimumSize">
+       <size>
+        <width>320</width>
+        <height>0</height>
+       </size>
+      </property>
+      <property name="maximumSize">
+       <size>
+        <width>360</width>
+        <height>16777215</height>
+       </size>
+      </property>
+      <property name="frameShape">
+       <enum>QFrame::StyledPanel</enum>
+      </property>
+      <layout class="QVBoxLayout" name="leftLayout">
+       <property name="spacing">
+        <number>6</number>
+       </property>
+       <item>
+        <widget class="QPushButton" name="openBtn">
+         <property name="text">
+          <string>Открыть файл</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="containerLabel">
+         <property name="text">
+          <string>Тип контейнера</string>
+         </property>
+         <property name="font">
+          <font>
+           <bold>true</bold>
+          </font>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="containerRadios">
+         <item>
+          <widget class="QRadioButton" name="squareRadio">
+           <property name="text">
+            <string>Квадратный</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QRadioButton" name="cylRadio">
+           <property name="text">
+            <string>Цилиндрический</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QLabel" name="instructionLabel">
+         <property name="text">
+          <string>Укажите курсором мыши диаметр контейнера на снимке и введите его истинное значение</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignTop|Qt::AlignLeft</set>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QFormLayout" name="inputsForm">
+         <item row="0" column="0">
+          <widget class="QLabel" name="diamLabel">
+           <property name="text">
+            <string>Диаметр</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1">
+          <widget class="QLineEdit" name="diamEdit">
+           <property name="placeholderText">
+            <string>мм</string>
+           </property>
+           <property name="maxLength">
+            <number>3</number>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="0">
+          <widget class="QLabel" name="thickLabel">
+           <property name="text">
+            <string>Толщина</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="1">
+          <widget class="QLineEdit" name="thickEdit">
+           <property name="placeholderText">
+            <string>мм</string>
+           </property>
+           <property name="maxLength">
+            <number>3</number>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QLabel" name="inclLabel">
+         <property name="text">
+          <string>Тип включений</string>
+         </property>
+         <property name="font">
+          <font>
+           <bold>true</bold>
+          </font>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="inclRadios">
+         <item>
+          <widget class="QRadioButton" name="cubicRadio">
+           <property name="text">
+            <string>Кубические</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QRadioButton" name="sphereRadio">
+           <property name="text">
+            <string>Шарообразные</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QPushButton" name="findInclusionsBtn">
+         <property name="text">
+          <string>Найти включения</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="calcVolumesBtn">
+         <property name="text">
+          <string>Рассчитать объемы</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="resultPorodaLabel">
+         <property name="text">
+          <string>Объем породы: — см³</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="resultInclLabel">
+         <property name="text">
+          <string>Объем включений: — мм³</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="leftBottomSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="bottomBtns">
+         <item>
+          <widget class="QPushButton" name="metodikaBtn">
+           <property name="text">
+            <string>Методика</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="protokolBtn">
+           <property name="text">
+            <string>Протокол</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+      </layout>
+     </widget>
+    </item>
+    <!-- RIGHT: side-by-side images (original + processed) -->
+    <item>
+     <layout class="QVBoxLayout" name="rightLayout">
+      <item>
+       <layout class="QHBoxLayout" name="imagesTopLabels">
+        <item>
+         <widget class="QLabel" name="originalLabel">
+          <property name="text">
+           <string>Оригинал</string>
+          </property>
+          <property name="alignment">
+           <set>Qt::AlignCenter</set>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="processedLabel">
+          <property name="text">
+           <string>Обработанный (включения)</string>
+          </property>
+          <property name="alignment">
+           <set>Qt::AlignCenter</set>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <widget class="QSplitter" name="imagesSplitter">
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="childrenCollapsible">
+         <bool>false</bool>
+        </property>
+        <widget class="QGraphicsView" name="originalView">
+         <property name="minimumSize">
+          <size>
+           <width>280</width>
+           <height>280</height>
+          </size>
+         </property>
+        </widget>
+        <widget class="QGraphicsView" name="processedView">
+         <property name="minimumSize">
+          <size>
+           <width>280</width>
+           <height>280</height>
+          </size>
+         </property>
+        </widget>
+       </widget>
+      </item>
+     </layout>
+    </item>
+   </layout>
+  </widget>
+  <widget class="QStatusBar" name="statusbar"/>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
