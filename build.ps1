@@ -19,11 +19,12 @@ if (-not (Test-Path $icon)) {
     $iconArg = "--icon=`"$icon`""
 }
 
-Write-Host "Running PyInstaller (onedir + windowed + noupx)..." -ForegroundColor Green
+Write-Host "Running PyInstaller using Xray_labs.spec (this includes ui/, resources/ and icon via datas)..." -ForegroundColor Green
 
-$cmd = "pyinstaller --clean --noconfirm --name Xray_labs --onedir --windowed --noupx --version-file=version_info.txt $iconArg main.py"
-Write-Host $cmd
-Invoke-Expression $cmd
+# Using the .spec is important because it declares the datas (ui folder, resources, icon, etc.)
+# Direct command-line on main.py would miss the ui/ files -> FileNotFoundError when loading .ui at runtime.
+pyinstaller --clean --noconfirm Xray_labs.spec
+Write-Host "PyInstaller finished." -ForegroundColor Green
 
 if (Test-Path "dist/Xray_labs/Xray_labs.exe") {
     Write-Host "`n=== BUILD SUCCESS ===" -ForegroundColor Green

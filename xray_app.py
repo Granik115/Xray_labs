@@ -38,6 +38,16 @@ from constants import (
     APP_NAME, APP_VERSION, GITHUB_REPO, get_app_stylesheet
 )
 
+def get_resource_path(relative_path: str) -> Path:
+    """Robust path resolver for both development and PyInstaller frozen onedir builds.
+    In frozen builds, data files (ui/, icon, resources/) live under sys._MEIPASS.
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base = Path(sys._MEIPASS)
+    else:
+        base = Path(__file__).resolve().parent
+    return base / relative_path
+
 # ---------------- Persistence (minimal, like MolPlayer style) ----------------
 def get_app_data_dir() -> Path:
     local = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or str(Path.home())
@@ -165,16 +175,11 @@ def make_pen(color: str = "#00bfff", width: int = 3) -> QPen:
 class Lab1Window(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
-        uic_path = Path(__file__).parent / "ui" / "lab1_window.ui"
-        if not uic_path.exists():
-            # Fallback for frozen
-            base = Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).parent
-            uic_path = base / "ui" / "lab1_window.ui"
-
+        uic_path = get_resource_path("ui/lab1_window.ui")
         uic.loadUi(str(uic_path), self)
 
         self.setWindowOpacity(0.93)
-        self.setWindowIcon(QIcon(str(Path(__file__).parent / "icon_cat.ico")))
+        self.setWindowIcon(QIcon(str(get_resource_path("icon_cat.ico"))))
 
         self.setStyleSheet(get_app_stylesheet())
 
@@ -458,8 +463,7 @@ class Lab1Window(QMainWindow):
         self.statusbar.showMessage("Расчёт выполнен. (Формулы включений — заглушка, обновите по методике)")
 
     def _open_pdf_placeholder(self, filename: str):
-        base = Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).parent
-        pdf_path = base / "resources" / filename
+        pdf_path = get_resource_path(f"resources/{filename}")
         if pdf_path.exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(pdf_path)))
         else:
@@ -479,16 +483,12 @@ class Lab1Window(QMainWindow):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        uic_path = Path(__file__).parent / "ui" / "main_window.ui"
-        if not uic_path.exists():
-            base = Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).parent
-            uic_path = base / "ui" / "main_window.ui"
-
+        uic_path = get_resource_path("ui/main_window.ui")
         uic.loadUi(str(uic_path), self)
 
         self.setWindowOpacity(0.93)
         try:
-            self.setWindowIcon(QIcon(str(Path(__file__).parent / "icon_cat.ico")))
+            self.setWindowIcon(QIcon(str(get_resource_path("icon_cat.ico"))))
         except Exception:
             pass
 
