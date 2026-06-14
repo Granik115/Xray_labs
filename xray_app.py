@@ -23,12 +23,13 @@ from PIL import Image
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QMessageBox, QFileDialog, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsEllipseItem, QGraphicsRectItem,
+    QGraphicsView,
     QPushButton, QRadioButton, QLabel, QLineEdit, QFrame, QVBoxLayout
 )
 from PyQt5.QtGui import (
-    QPixmap, QImage, QPen, QColor, QBrush, QFont, QIcon, QPainter
+    QPixmap, QImage, QPen, QColor, QBrush, QFont, QIcon, QPainter, QDesktopServices
 )
-from PyQt5.QtCore import Qt, QEvent, QPointF, QRectF, QTimer, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, QEvent, QPointF, QRectF, QTimer, pyqtSignal, QObject, QUrl
 from PyQt5 import uic
 
 from constants import (
@@ -149,15 +150,9 @@ def process_inclusions(
 
     return orig_rgb, processed, white_count
 
-# ---------------- Interactive image view (line drawing) ----------------
-class ImageGraphicsView(QGraphicsView):
-    """Plain QGraphicsView used in .ui. Line logic is handled via eventFilter in the window."""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setRenderHint(QPainter.Antialiasing, True)
-        self.setDragMode(QGraphicsView.NoDrag)
-        self.setMouseTracking(True)
-
+# ---------------- Interactive image view (line drawing via eventFilter) ----------------
+# Note: We use plain QGraphicsView from the .ui file + eventFilter on the viewport
+# for line drawing. No need for a promoted custom subclass in v1.
 
 def make_pen(color: str = "#00bfff", width: int = 3) -> QPen:
     pen = QPen(QColor(color))
@@ -193,15 +188,15 @@ class Lab1Window(QMainWindow):
 
         # Scenes
         self.original_scene = QGraphicsScene(self)
-        self.original_view.setScene(self.original_scene)
-        self.original_view.setRenderHint(QPainter.Antialiasing)
+        self.originalView.setScene(self.original_scene)
+        self.originalView.setRenderHint(QPainter.Antialiasing)
 
         self.processed_scene = QGraphicsScene(self)
-        self.processed_view.setScene(self.processed_scene)
-        self.processed_view.setRenderHint(QPainter.Antialiasing)
+        self.processedView.setScene(self.processed_scene)
+        self.processedView.setRenderHint(QPainter.Antialiasing)
 
         # Event filter for interactive line on original
-        self.original_view.viewport().installEventFilter(self)
+        self.originalView.viewport().installEventFilter(self)
 
         # Radios
         self.squareRadio.toggled.connect(self._update_instruction)
@@ -263,12 +258,12 @@ class Lab1Window(QMainWindow):
             pass
 
     def eventFilter(self, obj, event):
-        if obj is self.original_view.viewport():
+        if obj is self.originalView.viewport():
             if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
                 if self.original_pil is None:
                     return False
                 self._dragging_line = True
-                self._line_start = self.original_view.mapToScene(event.pos())
+                self._line_start = self.originalView.mapToScene(event.pos())
                 # remove old line
                 if self.current_line_item:
                     self.original_scene.removeItem(self.current_line_item)
@@ -276,7 +271,7 @@ class Lab1Window(QMainWindow):
                 return True
 
             elif event.type() == QEvent.MouseMove and self._dragging_line and self._line_start:
-                cur = self.original_view.mapToScene(event.pos())
+                cur = self.originalView.mapToScene(event.pos())
                 if self.current_line_item:
                     self.original_scene.removeItem(self.current_line_item)
                 pen = make_pen(ACCENT_GLOW, 2)
@@ -288,7 +283,7 @@ class Lab1Window(QMainWindow):
 
             elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton and self._dragging_line:
                 self._dragging_line = False
-                end = self.original_view.mapToScene(event.pos())
+                end = self.originalView.mapToScene(event.pos())
                 start = self._line_start
                 self._line_start = None
 
@@ -335,7 +330,7 @@ class Lab1Window(QMainWindow):
             item = QGraphicsPixmapItem(pix)
             self.original_scene.addItem(item)
             self.original_scene.setSceneRect(QRectF(0, 0, pix.width(), pix.height()))
-            self.original_view.fitInView(item, Qt.KeepAspectRatio)
+            self.originalView.fitInView(item, Qt.KeepAspectRatio)
 
             self.statusbar.showMessage(f"Загружен: {Path(path).name}  ({pil.width}x{pil.height}) — нарисуйте линию калибровки")
             # save last image path
@@ -392,8 +387,8 @@ class Lab1Window(QMainWindow):
                         cx - r, cy - r, r*2, r*2, pen
                     )
 
-            self.processed_view.fitInView(pitem, Qt.KeepAspectRatio)
-            self.original_view.fitInView(oitem, Qt.KeepAspectRatio)
+            self.processedView.fitInView(pitem, Qt.KeepAspectRatio)
+            self.originalView.fitInView(oitem, Qt.KeepAspectRatio)
 
             self.statusbar.showMessage(f"Включения найдены. Белых пикселей в маске: {white}. Теперь введите размеры и рассчитайте объёмы.")
         except Exception as e:
@@ -466,8 +461,6 @@ class Lab1Window(QMainWindow):
         base = Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).parent
         pdf_path = base / "resources" / filename
         if pdf_path.exists():
-            from PyQt5.QtGui import QDesktopServices
-            from PyQt5.QtCore import QUrl
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(pdf_path)))
         else:
             QMessageBox.information(
