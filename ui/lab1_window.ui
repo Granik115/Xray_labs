@@ -12,8 +12,8 @@
   </property>
   <property name="minimumSize">
    <size>
-    <width>900</width>
-    <height>560</height>
+    <width>1000</width>
+    <height>600</height>
    </size>
   </property>
   <property name="windowTitle">
@@ -36,18 +36,17 @@
     <property name="bottomMargin">
      <number>8</number>
     </property>
-    <!-- LEFT CONTROLS PANEL (dark blue like mocks) -->
     <item>
      <widget class="QFrame" name="leftPanel">
       <property name="minimumSize">
        <size>
-        <width>320</width>
+        <width>220</width>
         <height>0</height>
        </size>
       </property>
       <property name="maximumSize">
        <size>
-        <width>360</width>
+        <width>240</width>
         <height>16777215</height>
        </size>
       </property>
@@ -70,6 +69,9 @@
          <property name="text">
           <string>Тип контейнера</string>
          </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
          <property name="font">
           <font>
            <bold>true</bold>
@@ -78,7 +80,7 @@
         </widget>
        </item>
        <item>
-        <layout class="QHBoxLayout" name="containerRadios">
+        <layout class="QVBoxLayout" name="containerRadios">
          <item>
           <widget class="QRadioButton" name="squareRadio">
            <property name="text">
@@ -154,6 +156,9 @@
          <property name="text">
           <string>Тип включений</string>
          </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
          <property name="font">
           <font>
            <bold>true</bold>
@@ -162,7 +167,7 @@
         </widget>
        </item>
        <item>
-        <layout class="QHBoxLayout" name="inclRadios">
+        <layout class="QVBoxLayout" name="inclRadios">
          <item>
           <widget class="QRadioButton" name="cubicRadio">
            <property name="text">
@@ -199,20 +204,20 @@
        <item>
         <widget class="QLabel" name="resultPorodaLabel">
          <property name="text">
-          <string>Объем породы: — см³</string>
+          <string>Объем породы:</string>
          </property>
          <property name="alignment">
-          <set>Qt::AlignCenter</set>
+          <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
          </property>
         </widget>
        </item>
        <item>
         <widget class="QLabel" name="resultInclLabel">
          <property name="text">
-          <string>Объем включений: — мм³</string>
+          <string>Объем включений:</string>
          </property>
          <property name="alignment">
-          <set>Qt::AlignCenter</set>
+          <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
          </property>
         </widget>
        </item>
@@ -230,7 +235,7 @@
         </spacer>
        </item>
        <item>
-        <layout class="QHBoxLayout" name="bottomBtns">
+        <layout class="QVBoxLayout" name="bottomBtns">
          <item>
           <widget class="QPushButton" name="metodikaBtn">
            <property name="text">
@@ -250,64 +255,18 @@
       </layout>
      </widget>
     </item>
-    <!-- RIGHT: side-by-side images (original + processed) -->
     <item>
-     <layout class="QVBoxLayout" name="rightLayout">
-      <item>
-       <layout class="QHBoxLayout" name="imagesTopLabels">
-        <item>
-         <widget class="QLabel" name="originalLabel">
-          <property name="text">
-           <string>Оригинал</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QLabel" name="processedLabel">
-          <property name="text">
-           <string>Обработанный (включения)</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
-         </widget>
-        </item>
-       </layout>
-      </item>
-      <item>
-       <widget class="QSplitter" name="imagesSplitter">
-        <property name="orientation">
-         <enum>Qt::Horizontal</enum>
-        </property>
-        <property name="childrenCollapsible">
-         <bool>false</bool>
-        </property>
-        <widget class="QGraphicsView" name="originalView">
-         <property name="minimumSize">
-          <size>
-           <width>280</width>
-           <height>280</height>
-          </size>
-         </property>
-        </widget>
-        <widget class="QGraphicsView" name="processedView">
-         <property name="minimumSize">
-          <size>
-           <width>280</width>
-           <height>280</height>
-          </size>
-         </property>
-        </widget>
-       </widget>
-      </item>
-     </layout>
+     <widget class="QGraphicsView" name="imageView">
+      <property name="minimumSize">
+       <size>
+        <width>400</width>
+        <height>400</height>
+       </size>
+      </property>
+     </widget>
     </item>
    </layout>
   </widget>
-  <widget class="QStatusBar" name="statusbar"/>
  </widget>
  <resources/>
  <connections/>

@@ -1,5 +1,5 @@
 """
-X-Ray-lab v0.0.1
+X-Ray-lab v0.0.2
 PyQt5 + editable .ui files (open in Qt Designer).
 Color scheme from MolPlayer/constants.py (Laby.docx palette).
 """
@@ -73,11 +73,13 @@ def save_state(data: dict):
 
 # ---------------- Image processing (Pillow) ----------------
 def pil_to_pixmap(pil_img: Image.Image) -> QPixmap:
+    """Convert PIL image to QPixmap. Uses .copy() so buffer is not freed early (fixes crash)."""
     if pil_img.mode != "RGB":
         pil_img = pil_img.convert("RGB")
+    w, h = pil_img.size
     data = pil_img.tobytes("raw", "RGB")
-    qimg = QImage(data, pil_img.width, pil_img.height, QImage.Format_RGB888)
-    return QPixmap.fromImage(qimg)
+    qimg = QImage(data, w, h, w * 3, QImage.Format_RGB888)
+    return QPixmap.fromImage(qimg.copy())
 
 def process_inclusions(
     original: Image.Image,
@@ -202,8 +204,9 @@ def make_pen(color: str = "#00bfff", width: int = 3) -> QPen:
 
 # ---------------- Lab 1 Window ----------------
 class Lab1Window(QMainWindow):
-    def __init__(self, parent=None):
-        super().__init__(parent)
+    def __init__(self, main_window=None):
+        super().__init__(None)
+        self._main_window = main_window
         uic_path = get_resource_path("ui/lab1_window.ui")
         uic.loadUi(str(uic_path), self)
 
@@ -220,18 +223,16 @@ class Lab1Window(QMainWindow):
         self.white_px_count: int = 0
         self._dragging_line = False
         self._line_start: Optional[QPointF] = None
+        self._showing_processed = False
+        self._volumes_calculated = False
 
-        # Scenes
-        self.original_scene = QGraphicsScene(self)
-        self.originalView.setScene(self.original_scene)
-        self.originalView.setRenderHint(QPainter.Antialiasing)
+        self.image_scene = QGraphicsScene(self)
+        self.imageView.setScene(self.image_scene)
+        self.imageView.setRenderHint(QPainter.Antialiasing)
+        self.imageView.viewport().installEventFilter(self)
 
-        self.processed_scene = QGraphicsScene(self)
-        self.processedView.setScene(self.processed_scene)
-        self.processedView.setRenderHint(QPainter.Antialiasing)
-
-        # Event filter for interactive line on original
-        self.originalView.viewport().installEventFilter(self)
+        for layout in (self.containerRadios, self.inclRadios):
+            layout.setAlignment(Qt.AlignHCenter)
 
         # Radios
         self.squareRadio.toggled.connect(self._update_instruction)
@@ -249,15 +250,25 @@ class Lab1Window(QMainWindow):
         # Initial instruction
         self._update_instruction()
 
-        # Restore last values (minimal persistence)
         self._restore_last_values()
 
-        # Status
-        self.statusbar.showMessage("Готов. Откройте снимок и укажите линию диаметра/стороны.")
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._main_window:
+            geo = self._main_window.frameGeometry()
+            self.move(geo.x() + 48, geo.y() + 48)
+        self.raise_()
+        self.activateWindow()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self.raise_()
 
     def _update_instruction(self):
         if self.squareRadio.isChecked():
-            self.instructionLabel.setText("Укажите курсором мыши сторону квадрата на снимке и введите её истинное значение")
+            self.instructionLabel.setText(
+                "Укажите курсором мыши сторону контейнера на снимке и введите её истинное значение"
+            )
             self.diamLabel.setText("Сторона")
         else:
             self.instructionLabel.setText("Укажите курсором мыши диаметр контейнера на снимке и введите его истинное значение")
@@ -293,24 +304,23 @@ class Lab1Window(QMainWindow):
             pass
 
     def eventFilter(self, obj, event):
-        if obj is self.originalView.viewport():
+        if obj is self.imageView.viewport():
             if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                if self.original_pil is None:
+                if self.original_pil is None or self._showing_processed:
                     return False
                 self._dragging_line = True
-                self._line_start = self.originalView.mapToScene(event.pos())
-                # remove old line
+                self._line_start = self.imageView.mapToScene(event.pos())
                 if self.current_line_item:
-                    self.original_scene.removeItem(self.current_line_item)
+                    self.image_scene.removeItem(self.current_line_item)
                     self.current_line_item = None
                 return True
 
             elif event.type() == QEvent.MouseMove and self._dragging_line and self._line_start:
-                cur = self.originalView.mapToScene(event.pos())
+                cur = self.imageView.mapToScene(event.pos())
                 if self.current_line_item:
-                    self.original_scene.removeItem(self.current_line_item)
+                    self.image_scene.removeItem(self.current_line_item)
                 pen = make_pen(ACCENT_GLOW, 2)
-                self.current_line_item = self.original_scene.addLine(
+                self.current_line_item = self.image_scene.addLine(
                     self._line_start.x(), self._line_start.y(),
                     cur.x(), cur.y(), pen
                 )
@@ -318,59 +328,68 @@ class Lab1Window(QMainWindow):
 
             elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton and self._dragging_line:
                 self._dragging_line = False
-                end = self.originalView.mapToScene(event.pos())
+                end = self.imageView.mapToScene(event.pos())
                 start = self._line_start
                 self._line_start = None
 
                 if self.current_line_item:
-                    self.original_scene.removeItem(self.current_line_item)
+                    self.image_scene.removeItem(self.current_line_item)
 
-                # commit final blue line
                 pen = make_pen("#00bfff", 3)
-                self.current_line_item = self.original_scene.addLine(
+                self.current_line_item = self.image_scene.addLine(
                     start.x(), start.y(), end.x(), end.y(), pen
                 )
 
-                # store in ORIGINAL image pixel coords (scene == image px)
                 x1, y1 = int(start.x()), int(start.y())
                 x2, y2 = int(end.x()), int(end.y())
                 self.line_points = ((x1, y1), (x2, y2))
-                self.statusbar.showMessage(f"Линия сохранена: {math.hypot(x2-x1, y2-y1):.1f} px. Введите реальный размер.")
                 return True
 
         return super().eventFilter(obj, event)
 
+    def _reset_volume_labels(self):
+        self._volumes_calculated = False
+        self.resultPorodaLabel.setText("Объем породы:")
+        self.resultInclLabel.setText("Объем включений:")
+
+    def _display_pixmap(self, pix: QPixmap, draw_line: bool = False):
+        self.image_scene.clear()
+        item = QGraphicsPixmapItem(pix)
+        self.image_scene.addItem(item)
+        self.image_scene.setSceneRect(QRectF(0, 0, pix.width(), pix.height()))
+        if draw_line and self.line_points:
+            (x1, y1), (x2, y2) = self.line_points
+            pen = make_pen("#00bfff", 3)
+            self.current_line_item = self.image_scene.addLine(x1, y1, x2, y2, pen)
+        self.imageView.fitInView(item, Qt.KeepAspectRatio)
+
     def _open_file(self):
+        st = load_state()
+        start_dir = st.get("last_open_dir", "")
+        if start_dir and not os.path.isdir(start_dir):
+            start_dir = ""
+
         path, _ = QFileDialog.getOpenFileName(
-            self, "Открыть снимок", "", "Images (*.jpg *.jpeg *.bmp *.png);;All files (*)"
+            self, "Открыть снимок", start_dir,
+            "Images (*.jpg *.jpeg *.bmp *.png);;All files (*)"
         )
         if not path:
             return
 
         try:
-            pil = Image.open(path)
-            self.original_pil = pil.convert("RGB")
+            with Image.open(path) as img:
+                self.original_pil = img.convert("RGB").copy()
             self.line_points = None
-            if self.current_line_item:
-                self.original_scene.removeItem(self.current_line_item)
-                self.current_line_item = None
+            self.current_line_item = None
             self.white_px_count = 0
+            self._showing_processed = False
+            self._reset_volume_labels()
 
-            # Clear processed
-            self.processed_scene.clear()
-
-            # Load into original view (full res in scene)
             pix = pil_to_pixmap(self.original_pil)
-            self.original_scene.clear()
-            item = QGraphicsPixmapItem(pix)
-            self.original_scene.addItem(item)
-            self.original_scene.setSceneRect(QRectF(0, 0, pix.width(), pix.height()))
-            self.originalView.fitInView(item, Qt.KeepAspectRatio)
+            self._display_pixmap(pix, draw_line=False)
 
-            self.statusbar.showMessage(f"Загружен: {Path(path).name}  ({pil.width}x{pil.height}) — нарисуйте линию калибровки")
-            # save last image path
-            st = load_state()
             st["last_image"] = path
+            st["last_open_dir"] = str(Path(path).parent)
             save_state(st)
 
         except Exception as e:
@@ -382,30 +401,17 @@ class Lab1Window(QMainWindow):
             return
         ctype = "square" if self.squareRadio.isChecked() else "cylinder"
         try:
-            orig, proc, white = process_inclusions(self.original_pil, self.line_points, ctype)
+            _, proc, white = process_inclusions(self.original_pil, self.line_points, ctype)
             self.white_px_count = white
+            self._showing_processed = True
+            self.current_line_item = None
 
-            # Show original (with line if any)
-            self.original_scene.clear()
-            opix = pil_to_pixmap(orig)
-            oitem = QGraphicsPixmapItem(opix)
-            self.original_scene.addItem(oitem)
-            self.original_scene.setSceneRect(QRectF(0, 0, opix.width(), opix.height()))
-
-            # Re-draw line on original if present
-            if self.line_points:
-                (x1, y1), (x2, y2) = self.line_points
-                pen = make_pen("#00bfff", 3)
-                self.current_line_item = self.original_scene.addLine(x1, y1, x2, y2, pen)
-
-            # Processed (side-by-side)
-            self.processed_scene.clear()
             ppix = pil_to_pixmap(proc)
+            self.image_scene.clear()
             pitem = QGraphicsPixmapItem(ppix)
-            self.processed_scene.addItem(pitem)
-            self.processed_scene.setSceneRect(QRectF(0, 0, ppix.width(), ppix.height()))
+            self.image_scene.addItem(pitem)
+            self.image_scene.setSceneRect(QRectF(0, 0, ppix.width(), ppix.height()))
 
-            # Draw ROI outline on processed for clarity
             if self.line_points:
                 (x1, y1), (x2, y2) = self.line_points
                 cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
@@ -413,19 +419,12 @@ class Lab1Window(QMainWindow):
                 pen = make_pen(ACCENT_GLOW, 2)
                 if ctype == "square":
                     side = length
-                    self.processed_scene.addRect(
-                        cx - side/2, cy - side/2, side, side, pen
-                    )
+                    self.image_scene.addRect(cx - side / 2, cy - side / 2, side, side, pen)
                 else:
                     r = length / 2
-                    self.processed_scene.addEllipse(
-                        cx - r, cy - r, r*2, r*2, pen
-                    )
+                    self.image_scene.addEllipse(cx - r, cy - r, r * 2, r * 2, pen)
 
-            self.processedView.fitInView(pitem, Qt.KeepAspectRatio)
-            self.originalView.fitInView(oitem, Qt.KeepAspectRatio)
-
-            self.statusbar.showMessage(f"Включения найдены. Белых пикселей в маске: {white}. Теперь введите размеры и рассчитайте объёмы.")
+            self.imageView.fitInView(pitem, Qt.KeepAspectRatio)
         except Exception as e:
             QMessageBox.critical(self, "Ошибка обработки", str(e))
 
@@ -483,13 +482,10 @@ class Lab1Window(QMainWindow):
 
         poroda_cm3 = poroda_mm3 / 1000.0
 
-        # Update UI
+        self._volumes_calculated = True
         self.resultPorodaLabel.setText(f"Объем породы: {poroda_cm3:.2f} см³")
         self.resultInclLabel.setText(f"Объем включений: {incl_mm3:.2f} мм³")
-
         self._save_last_values()
-
-        self.statusbar.showMessage("Расчёт выполнен.")
 
     def _open_pdf_placeholder(self, filename: str):
         pdf_path = get_resource_path(f"resources/{filename}")
@@ -598,9 +594,13 @@ class MainWindow(QMainWindow):
             self.update_btn.move(self.width() - 40, 8)
             self.rollback_btn.move(self.width() - 70, 8)
 
+        self._lab_windows = []
         self._populate_lab_buttons()
         QTimer.singleShot(8000, lambda: self._check_for_updates(silent=True))
-        self.statusbar.showMessage("Готов. Выберите лабораторную работу.")
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self.raise_()
 
     def _populate_lab_buttons(self):
         container = self.labsContainer
@@ -612,10 +612,18 @@ class MainWindow(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
 
-        # Real lab 1
+        lab_btn_style = (
+            f"QPushButton {{ text-align: left; padding-left: 10px; }}"
+        )
+        disabled_style = (
+            f"QPushButton {{ background-color: {BG_TRACK}; color: {TEXT_MUTED}; "
+            f"text-align: left; padding-left: 10px; }}"
+        )
+
         btn1 = QPushButton("1. Оценка концентрации вещества рентгеноабсорбционным методом")
         btn1.setMinimumHeight(42)
         btn1.setMaximumHeight(42)
+        btn1.setStyleSheet(lab_btn_style)
         btn1.clicked.connect(self._open_lab1)
         layout.addWidget(btn1)
 
@@ -624,7 +632,7 @@ class MainWindow(QMainWindow):
             b.setMinimumHeight(42)
             b.setMaximumHeight(42)
             b.setEnabled(False)
-            b.setStyleSheet(f"QPushButton {{ background-color: {BG_TRACK}; color: {TEXT_MUTED}; }}")
+            b.setStyleSheet(disabled_style)
             layout.addWidget(b)
 
         # Small version label at bottom
@@ -634,7 +642,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(ver)
 
     def _open_lab1(self):
-        lab = Lab1Window(self)
+        lab = Lab1Window(main_window=self)
+
+        def _on_lab_closed(obj=None, lw=lab):
+            try:
+                self._lab_windows.remove(lw)
+            except ValueError:
+                pass
+
+        lab.destroyed.connect(_on_lab_closed)
+        self._lab_windows.append(lab)
         lab.show()
 
     def _show_rollback_versions(self):
@@ -707,7 +724,7 @@ class MainWindow(QMainWindow):
                             self._on_ui(lambda: QMessageBox.information(
                                 self, "Обновления",
                                 "На GitHub пока нет опубликованных релизов.\n\n"
-                                "Создайте Release v0.0.1 и загрузите Xray_labs-portable.zip."
+                                "Создайте Release и загрузите Xray_labs-portable.zip."
                             ))
                         return
                     if not silent:
