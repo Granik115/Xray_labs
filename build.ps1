@@ -7,7 +7,7 @@ Write-Host "=== X-Ray-lab PyInstaller build ===" -ForegroundColor Cyan
 
 python -m pip install -r requirements.txt --quiet
 
-$version = "0.0.2"
+$version = "0.0.3"
 
 $dist = "dist"
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }

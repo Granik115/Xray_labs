@@ -1,5 +1,5 @@
 """
-X-Ray-lab v0.0.2
+X-Ray-lab v0.0.3
 PyQt5 + editable .ui files (open in Qt Designer).
 Color scheme from MolPlayer/constants.py (Laby.docx palette).
 """
@@ -16,18 +16,18 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from PIL import Image
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QMessageBox, QFileDialog, QGraphicsScene,
-    QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsEllipseItem, QGraphicsRectItem,
-    QGraphicsView, QDialog, QVBoxLayout, QHBoxLayout,
+    QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsEllipseItem, QGraphicsPolygonItem,
+    QGraphicsView, QVBoxLayout, QHBoxLayout, QButtonGroup,
     QPushButton, QRadioButton, QLabel, QLineEdit, QFrame, QWidget
 )
 from PyQt5.QtGui import (
-    QPixmap, QImage, QPen, QColor, QBrush, QFont, QIcon, QPainter, QDesktopServices
+    QPixmap, QImage, QPen, QColor, QBrush, QFont, QIcon, QPainter, QDesktopServices, QPolygonF
 )
 from PyQt5.QtCore import Qt, QEvent, QPointF, QRectF, QTimer, pyqtSignal, QObject, QUrl
 from PyQt5 import uic
@@ -81,6 +81,37 @@ def pil_to_pixmap(pil_img: Image.Image) -> QPixmap:
     qimg = QImage(data, w, h, w * 3, QImage.Format_RGB888)
     return QPixmap.fromImage(qimg.copy())
 
+def square_corners_from_diagonal(
+    x1: float, y1: float, x2: float, y2: float
+) -> Optional[List[Tuple[float, float]]]:
+    """Квадрат: отрезок (x1,y1)-(x2,y2) — диагональ. Возвращает 4 угла."""
+    d = math.hypot(x2 - x1, y2 - y1)
+    if d < 1e-6:
+        return None
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    wx, wy = -(y2 - y1) / d, (x2 - x1) / d
+    off = d / (2.0 * math.sqrt(2.0))
+    return [
+        (x1, y1),
+        (cx + wx * off, cy + wy * off),
+        (x2, y2),
+        (cx - wx * off, cy - wy * off),
+    ]
+
+
+def point_in_polygon(px: float, py: float, poly: List[Tuple[float, float]]) -> bool:
+    inside = False
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        if ((y1 > py) != (y2 > py)) and (
+            px < (x2 - x1) * (py - y1) / (y2 - y1 + 1e-12) + x1
+        ):
+            inside = not inside
+    return inside
+
+
 def process_inclusions(
     original: Image.Image,
     line_points: Optional[Tuple[Tuple[int, int], Tuple[int, int]]],
@@ -102,51 +133,41 @@ def process_inclusions(
     w, h = gray.size
     orig_rgb = original.convert("RGB") if original.mode != "RGB" else original
 
-    # Default: no mask -> whole image
-    mask = Image.new("L", (w, h), 0)
-    draw_mask = None
+    square_poly: Optional[List[Tuple[float, float]]] = None
+    circle_params: Optional[Tuple[float, float, float]] = None  # cx, cy, r
 
     if line_points and len(line_points) == 2:
         (x1, y1), (x2, y2) = line_points
-        cx = (x1 + x2) / 2.0
-        cy = (y1 + y2) / 2.0
         length = math.hypot(x2 - x1, y2 - y1)
         if length < 3:
             length = max(w, h) * 0.8
-
-        from PIL import ImageDraw
-        mask = Image.new("L", (w, h), 0)
-        draw_mask = ImageDraw.Draw(mask)
+            cx = w / 2.0
+            cy = h / 2.0
+            x1, y1 = int(cx - length / 2), int(cy)
+            x2, y2 = int(cx + length / 2), int(cy)
 
         if container_type == "square":
-            side = length
-            left = int(cx - side / 2)
-            top = int(cy - side / 2)
-            right = int(cx + side / 2)
-            bottom = int(cy + side / 2)
-            draw_mask.rectangle([left, top, right, bottom], fill=255)
+            square_poly = square_corners_from_diagonal(x1, y1, x2, y2)
         else:
-            # cylinder -> circle/ellipse
-            r = length / 2.0
-            left = int(cx - r)
-            top = int(cy - r)
-            right = int(cx + r)
-            bottom = int(cy + r)
-            draw_mask.ellipse([left, top, right, bottom], fill=255)
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            circle_params = (cx, cy, length / 2.0)
 
     processed = Image.new("RGB", (w, h), (128, 128, 128))  # outside = gray
     white_count = 0
 
     orig_pixels = orig_rgb.load()
     gray_pixels = gray.load()
-    mask_pixels = mask.load() if mask else None
     proc_pixels = processed.load()
 
     for y in range(h):
         for x in range(w):
             in_roi = True
-            if mask_pixels is not None:
-                in_roi = mask_pixels[x, y] > 128
+            if square_poly is not None:
+                in_roi = point_in_polygon(x + 0.5, y + 0.5, square_poly)
+            elif circle_params is not None:
+                cx, cy, r = circle_params
+                in_roi = (x - cx) ** 2 + (y - cy) ** 2 <= r * r
 
             g = gray_pixels[x, y]
 
@@ -174,15 +195,67 @@ def ver_tuple(v: str) -> tuple:
         return (0, 0, 0)
 
 
+def github_request(url: str, timeout: int = 30) -> bytes:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": f"{APP_NAME}-Updater/{APP_VERSION}",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def download_release_asset(url: str, dest_path: str):
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": f"{APP_NAME}-Updater/{APP_VERSION}"},
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        with open(dest_path, "wb") as out:
+            shutil.copyfileobj(resp, out)
+
+
 def find_portable_asset_url(release_data: dict) -> Optional[str]:
-    for asset in release_data.get("assets", []):
+    assets = release_data.get("assets", [])
+    versioned = []
+    generic = []
+    other = []
+    for asset in assets:
         name = asset.get("name", "")
-        if "portable" in name.lower() and name.endswith(".zip"):
-            return asset.get("browser_download_url")
-    for asset in release_data.get("assets", []):
-        if asset.get("name", "").endswith(".zip"):
-            return asset.get("browser_download_url")
+        url = asset.get("browser_download_url")
+        if not url or not name.endswith(".zip"):
+            continue
+        low = name.lower()
+        if "portable" in low and "-v" in low:
+            versioned.append(url)
+        elif low == "xray_labs-portable.zip":
+            generic.append(url)
+        elif "portable" in low:
+            other.append(url)
+        else:
+            other.append(url)
+    for bucket in (versioned, generic, other):
+        if bucket:
+            return bucket[0]
     return None
+
+
+def get_app_install_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def find_extracted_app_dir(extract_dir: str) -> str:
+    direct = os.path.join(extract_dir, "Xray_labs")
+    if os.path.isfile(os.path.join(direct, "Xray_labs.exe")):
+        return direct
+    for root, _, files in os.walk(extract_dir):
+        if "Xray_labs.exe" in files:
+            return root
+    return extract_dir
 
 
 def calc_inclusion_volume_mm3(area_mm2: float, thick_mm: float, incl_type: str) -> float:
@@ -234,11 +307,18 @@ class Lab1Window(QMainWindow):
         for layout in (self.containerRadios, self.inclRadios):
             layout.setAlignment(Qt.AlignHCenter)
 
-        # Radios
-        self.squareRadio.toggled.connect(self._update_instruction)
-        self.cylRadio.toggled.connect(self._update_instruction)
-        self.cubicRadio.toggled.connect(lambda: None)  # just for future
-        self.sphereRadio.toggled.connect(lambda: None)
+        self._container_group = QButtonGroup(self)
+        self._container_group.addButton(self.squareRadio)
+        self._container_group.addButton(self.cylRadio)
+        self._container_group.setExclusive(True)
+
+        self._incl_group = QButtonGroup(self)
+        self._incl_group.addButton(self.cubicRadio)
+        self._incl_group.addButton(self.sphereRadio)
+        self._incl_group.setExclusive(True)
+
+        self.squareRadio.toggled.connect(self._on_container_changed)
+        self.cylRadio.toggled.connect(self._on_container_changed)
 
         # Buttons
         self.openBtn.clicked.connect(self._open_file)
@@ -264,30 +344,57 @@ class Lab1Window(QMainWindow):
         super().focusInEvent(event)
         self.raise_()
 
+    def _get_container_type(self) -> str:
+        return "square" if self.squareRadio.isChecked() else "cylinder"
+
     def _update_instruction(self):
-        if self.squareRadio.isChecked():
+        if self._get_container_type() == "square":
             self.instructionLabel.setText(
-                "Укажите курсором мыши сторону контейнера на снимке и введите её истинное значение"
+                "Укажите курсором мыши диагональ квадратного контейнера на снимке "
+                "и введите её параметры"
             )
-            self.diamLabel.setText("Сторона")
+            self.diamLabel.setText("Диагональ")
         else:
-            self.instructionLabel.setText("Укажите курсором мыши диаметр контейнера на снимке и введите его истинное значение")
+            self.instructionLabel.setText(
+                "Укажите курсором мыши диаметр цилиндрического контейнера на снимке "
+                "и введите его параметры"
+            )
             self.diamLabel.setText("Диаметр")
+
+    def _on_container_changed(self, checked: bool):
+        if not checked:
+            return
+        self._update_instruction()
+        self.white_px_count = 0
+        if self._showing_processed and self.original_pil is not None:
+            self._showing_processed = False
+            pix = pil_to_pixmap(self.original_pil)
+            self._display_pixmap(pix, draw_line=True)
 
     def _restore_last_values(self):
         st = load_state()
-        if "last_diam" in st:
-            self.diamEdit.setText(str(st["last_diam"]))
-        if "last_thick" in st:
-            self.thickEdit.setText(str(st["last_thick"]))
-        if st.get("last_container") == "square":
-            self.squareRadio.setChecked(True)
-        else:
-            self.cylRadio.setChecked(True)
-        if st.get("last_incl") == "cubic":
-            self.cubicRadio.setChecked(True)
-        else:
-            self.sphereRadio.setChecked(True)
+        self.squareRadio.blockSignals(True)
+        self.cylRadio.blockSignals(True)
+        self.cubicRadio.blockSignals(True)
+        self.sphereRadio.blockSignals(True)
+        try:
+            if "last_diam" in st:
+                self.diamEdit.setText(str(st["last_diam"]))
+            if "last_thick" in st:
+                self.thickEdit.setText(str(st["last_thick"]))
+            if st.get("last_container") == "square":
+                self.squareRadio.setChecked(True)
+            else:
+                self.cylRadio.setChecked(True)
+            if st.get("last_incl") == "cubic":
+                self.cubicRadio.setChecked(True)
+            else:
+                self.sphereRadio.setChecked(True)
+        finally:
+            self.squareRadio.blockSignals(False)
+            self.cylRadio.blockSignals(False)
+            self.cubicRadio.blockSignals(False)
+            self.sphereRadio.blockSignals(False)
         self._update_instruction()
 
     def _save_last_values(self):
@@ -297,7 +404,7 @@ class Lab1Window(QMainWindow):
                 st["last_diam"] = int(self.diamEdit.text().strip())
             if self.thickEdit.text().strip():
                 st["last_thick"] = int(self.thickEdit.text().strip())
-            st["last_container"] = "square" if self.squareRadio.isChecked() else "cylinder"
+            st["last_container"] = self._get_container_type()
             st["last_incl"] = "cubic" if self.cubicRadio.isChecked() else "sphere"
             save_state(st)
         except Exception:
@@ -399,7 +506,7 @@ class Lab1Window(QMainWindow):
         if self.original_pil is None:
             QMessageBox.information(self, "Нет снимка", "Сначала откройте файл.")
             return
-        ctype = "square" if self.squareRadio.isChecked() else "cylinder"
+        ctype = self._get_container_type()
         try:
             _, proc, white = process_inclusions(self.original_pil, self.line_points, ctype)
             self.white_px_count = white
@@ -414,14 +521,15 @@ class Lab1Window(QMainWindow):
 
             if self.line_points:
                 (x1, y1), (x2, y2) = self.line_points
-                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                length = math.hypot(x2 - x1, y2 - y1)
                 pen = make_pen(ACCENT_GLOW, 2)
                 if ctype == "square":
-                    side = length
-                    self.image_scene.addRect(cx - side / 2, cy - side / 2, side, side, pen)
+                    corners = square_corners_from_diagonal(x1, y1, x2, y2)
+                    if corners:
+                        poly = QPolygonF([QPointF(cx, cy) for cx, cy in corners])
+                        self.image_scene.addPolygon(poly, pen)
                 else:
-                    r = length / 2
+                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                    r = math.hypot(x2 - x1, y2 - y1) / 2
                     self.image_scene.addEllipse(cx - r, cy - r, r * 2, r * 2, pen)
 
             self.imageView.fitInView(pitem, Qt.KeepAspectRatio)
@@ -459,18 +567,16 @@ class Lab1Window(QMainWindow):
             QMessageBox.warning(self, "Линия слишком короткая", "Перерисуйте линию.")
             return
 
+        ctype = self._get_container_type()
+        # real_size: диагональ (квадрат) или диаметр (цилиндр) в мм
         scale_mm_per_px = real_size / px_len
 
-        # Inclusion area from last "Найти включения"
         if self.white_px_count <= 0:
-            # Auto-run find if not done
             self._find_inclusions()
         area_mm2 = self.white_px_count * (scale_mm_per_px ** 2)
 
-        # Container volume
-        ctype = "square" if self.squareRadio.isChecked() else "cylinder"
         if ctype == "square":
-            side_mm = real_size
+            side_mm = real_size / math.sqrt(2.0)
             container_mm3 = side_mm * side_mm * thick
         else:
             r = real_size / 2.0
@@ -663,9 +769,7 @@ class MainWindow(QMainWindow):
         def worker():
             try:
                 api = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
-                req = urllib.request.Request(api, headers={"User-Agent": f"{APP_NAME}-Updater/1.0"})
-                with urllib.request.urlopen(req, timeout=12) as resp:
-                    releases = json.loads(resp.read().decode("utf-8"))
+                releases = json.loads(github_request(api, timeout=20).decode("utf-8"))
 
                 current = ver_tuple(APP_VERSION)
                 candidates = []
@@ -714,10 +818,8 @@ class MainWindow(QMainWindow):
         def worker():
             try:
                 api = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-                req = urllib.request.Request(api, headers={"User-Agent": f"{APP_NAME}-Updater/1.0"})
                 try:
-                    with urllib.request.urlopen(req, timeout=12) as resp:
-                        data = json.loads(resp.read().decode("utf-8"))
+                    data = json.loads(github_request(api, timeout=20).decode("utf-8"))
                 except urllib.error.HTTPError as http_err:
                     if http_err.code == 404:
                         if not silent:
@@ -777,52 +879,83 @@ class MainWindow(QMainWindow):
         progress.setText(f"Загрузка {new_tag}...")
         progress.setStandardButtons(QMessageBox.NoButton)
         progress.show()
+        QApplication.processEvents()
 
         def worker():
+            tmp_zip = None
+            extract_dir = None
             try:
-                tmp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip").name
-                urllib.request.urlretrieve(download_url, tmp_zip)
+                tmp_zip = os.path.join(tempfile.gettempdir(), f"xray_upd_{new_tag}.zip")
+                download_release_asset(download_url, tmp_zip)
 
                 extract_dir = tempfile.mkdtemp(prefix="xray_upd_")
                 with zipfile.ZipFile(tmp_zip, "r") as z:
                     z.extractall(extract_dir)
 
-                src_dir = os.path.join(extract_dir, "Xray_labs")
-                if not os.path.isdir(src_dir):
-                    src_dir = extract_dir
-
-                if getattr(sys, "frozen", False):
-                    app_dir = os.path.dirname(sys.executable)
-                else:
-                    app_dir = os.path.dirname(os.path.abspath(__file__))
+                src_dir = find_extracted_app_dir(extract_dir)
+                app_dir = get_app_install_dir()
+                exe_path = os.path.join(app_dir, "Xray_labs.exe")
 
                 bat = os.path.join(tempfile.gettempdir(), "xray_updater.bat")
+                src_q = src_dir.replace('"', '""')
+                app_q = app_dir.replace('"', '""')
+                ext_q = extract_dir.replace('"', '""')
+                zip_q = tmp_zip.replace('"', '""')
                 bat_content = f"""@echo off
 chcp 65001 >nul
-timeout /t 2 /nobreak >nul
-robocopy "{src_dir}" "{app_dir}" /E /R:2 /W:1 /NFL /NDL /NJH /NJS
-start "" "{app_dir}\\Xray_labs.exe"
-rd /s /q "{extract_dir}" >nul 2>&1
+setlocal
+set "SRC={src_q}"
+set "DEST={app_q}"
+set "EXE={exe_path}"
+set "EXTRACT={ext_q}"
+echo Ozhidanie zakrytiya Xray_labs...
+:waitloop
+tasklist /FI "IMAGENAME eq Xray_labs.exe" 2>nul | find /I "Xray_labs.exe" >nul
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >nul
+    goto waitloop
+)
+echo Kopirovanie obnovleniya...
+robocopy "%SRC%" "%DEST%" /E /R:8 /W:2 /NFL /NDL /NJH /NJS
+if errorlevel 8 (
+    echo Oshibka robocopy: %errorlevel%
+    pause
+    exit /b 1
+)
+start "" "%EXE%"
+rd /s /q "%EXTRACT%" >nul 2>&1
+del /f /q "{zip_q}" >nul 2>&1
 del "%~f0" >nul 2>&1
 """
                 with open(bat, "w", encoding="cp866") as f:
                     f.write(bat_content)
 
                 self._on_ui(progress.close)
-                self._on_ui(lambda: self._launch_updater(bat))
+                self._on_ui(lambda b=bat: self._launch_updater(b))
             except Exception as ex:
                 self._on_ui(progress.close)
-                self._on_ui(lambda: QMessageBox.critical(self, "Ошибка обновления", str(ex)))
+                self._on_ui(lambda e=ex: QMessageBox.critical(
+                    self, "Ошибка обновления", f"Не удалось загрузить или подготовить обновление:\n{e}"
+                ))
+                if tmp_zip and os.path.isfile(tmp_zip):
+                    try:
+                        os.remove(tmp_zip)
+                    except OSError:
+                        pass
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _launch_updater(self, bat_path: str):
+        CREATE_NO_WINDOW = 0x08000000
         try:
-            CREATE_NO_WINDOW = 0x08000000
-            subprocess.Popen(["cmd", "/c", bat_path], shell=True, creationflags=CREATE_NO_WINDOW)
+            subprocess.Popen(
+                ["cmd.exe", "/c", bat_path],
+                creationflags=CREATE_NO_WINDOW,
+                close_fds=True,
+            )
         except Exception:
-            subprocess.Popen(bat_path, shell=True)
-        self.close()
+            os.startfile(bat_path)
+        QApplication.quit()
 
 
 def main():

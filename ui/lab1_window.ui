@@ -103,7 +103,7 @@
        <item>
         <widget class="QLabel" name="instructionLabel">
          <property name="text">
-          <string>Укажите курсором мыши диаметр контейнера на снимке и введите его истинное значение</string>
+          <string>Укажите курсором мыши диаметр цилиндрического контейнера на снимке и введите его параметры</string>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
