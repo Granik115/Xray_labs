@@ -92,3 +92,7 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Temp / extracted docs
+Laby_extracted.txt
+~$*.docx

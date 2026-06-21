@@ -1,8 +1,7 @@
 """
-X-Ray-lab v1.0.0
+X-Ray-lab v0.0.1
 PyQt5 + editable .ui files (open in Qt Designer).
-Color scheme 100% from MolPlayer/constants.py
-Follows Laby.docx + embedded mocks exactly.
+Color scheme from MolPlayer/constants.py (Laby.docx palette).
 """
 
 import sys
@@ -11,6 +10,7 @@ import json
 import math
 import tempfile
 import urllib.request
+import urllib.error
 import zipfile
 import shutil
 import subprocess
@@ -23,8 +23,8 @@ from PIL import Image
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QMessageBox, QFileDialog, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsEllipseItem, QGraphicsRectItem,
-    QGraphicsView,
-    QPushButton, QRadioButton, QLabel, QLineEdit, QFrame, QVBoxLayout
+    QGraphicsView, QDialog, QVBoxLayout, QHBoxLayout,
+    QPushButton, QRadioButton, QLabel, QLineEdit, QFrame, QWidget
 )
 from PyQt5.QtGui import (
     QPixmap, QImage, QPen, QColor, QBrush, QFont, QIcon, QPainter, QDesktopServices
@@ -33,9 +33,9 @@ from PyQt5.QtCore import Qt, QEvent, QPointF, QRectF, QTimer, pyqtSignal, QObjec
 from PyQt5 import uic
 
 from constants import (
-    BG_DARK, BG_PANEL, BTN_BG, BTN_HOVER, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED,
+    BG_DARK, BG_PANEL, BG_TRACK, BTN_BG, BTN_HOVER, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED,
     ACCENT_GLOW, ACCENT_FRAME, DEPTH_BLUE, BORDER,
-    APP_NAME, APP_VERSION, GITHUB_REPO, get_app_stylesheet
+    APP_NAME, APP_DISPLAY_NAME, APP_VERSION, GITHUB_REPO, get_app_stylesheet
 )
 
 def get_resource_path(relative_path: str) -> Path:
@@ -164,6 +164,35 @@ def process_inclusions(
 # Note: We use plain QGraphicsView from the .ui file + eventFilter on the viewport
 # for line drawing. No need for a promoted custom subclass in v1.
 
+def ver_tuple(v: str) -> tuple:
+    v = v.lstrip("vV")
+    try:
+        return tuple(int(x) for x in v.split(".")[:3])
+    except Exception:
+        return (0, 0, 0)
+
+
+def find_portable_asset_url(release_data: dict) -> Optional[str]:
+    for asset in release_data.get("assets", []):
+        name = asset.get("name", "")
+        if "portable" in name.lower() and name.endswith(".zip"):
+            return asset.get("browser_download_url")
+    for asset in release_data.get("assets", []):
+        if asset.get("name", "").endswith(".zip"):
+            return asset.get("browser_download_url")
+    return None
+
+
+def calc_inclusion_volume_mm3(area_mm2: float, thick_mm: float, incl_type: str) -> float:
+    """Объём включений по типу частиц (стереологическая аппроксимация из 2D-площади)."""
+    if area_mm2 <= 0 or thick_mm <= 0:
+        return 0.0
+    if incl_type == "cubic":
+        return area_mm2 * thick_mm
+    # шарообразные: V = (4/3)*pi*r^3 при S = pi*r^2 => V = (4/(3*sqrt(pi))) * S^(3/2)
+    return (4.0 / (3.0 * math.sqrt(math.pi))) * (area_mm2 ** 1.5)
+
+
 def make_pen(color: str = "#00bfff", width: int = 3) -> QPen:
     pen = QPen(QColor(color))
     pen.setWidth(width)
@@ -179,6 +208,7 @@ class Lab1Window(QMainWindow):
         uic.loadUi(str(uic_path), self)
 
         self.setWindowOpacity(0.93)
+        self.setFixedSize(1000, 600)
         self.setWindowIcon(QIcon(str(get_resource_path("icon_cat.ico"))))
 
         self.setStyleSheet(get_app_stylesheet())
@@ -416,7 +446,7 @@ class Lab1Window(QMainWindow):
             real_size = 0.0
             thick = 0.0
 
-        if not has_line or real_size <= 0 or thick <= 0:
+        if not has_line or real_size <= 0 or thick <= 0 or real_size > 99 or thick > 99:
             QMessageBox.information(
                 self, "Недостаточно данных",
                 "Котик, не ходи мимо лотка и введи все требуемые данные для расчета"
@@ -447,9 +477,8 @@ class Lab1Window(QMainWindow):
             r = real_size / 2.0
             container_mm3 = math.pi * r * r * thick
 
-        # Inclusion volume (PLACEHOLDER — user will provide exact formulas)
-        # Current: simple area * thickness (2.5D). TODO: spherical 4/3 π r³ etc.
-        incl_mm3 = area_mm2 * thick
+        incl_type = "cubic" if self.cubicRadio.isChecked() else "sphere"
+        incl_mm3 = calc_inclusion_volume_mm3(area_mm2, thick, incl_type)
         poroda_mm3 = max(0.0, container_mm3 - incl_mm3)
 
         poroda_cm3 = poroda_mm3 / 1000.0
@@ -460,7 +489,7 @@ class Lab1Window(QMainWindow):
 
         self._save_last_values()
 
-        self.statusbar.showMessage("Расчёт выполнен. (Формулы включений — заглушка, обновите по методике)")
+        self.statusbar.showMessage("Расчёт выполнен.")
 
     def _open_pdf_placeholder(self, filename: str):
         pdf_path = get_resource_path(f"resources/{filename}")
@@ -479,44 +508,98 @@ class Lab1Window(QMainWindow):
         super().closeEvent(event)
 
 
+# ---------------- Rollback popup (PyQt version of MolPlayer popup) ----------------
+class RollbackPopup(QFrame):
+    version_chosen = pyqtSignal(str, str)
+
+    def __init__(self, parent, candidates: list, anchor_widget: QWidget):
+        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
+        self.setObjectName("rollbackPopup")
+        self.setStyleSheet(f"""
+            QFrame#rollbackPopup {{
+                background-color: {BG_PANEL};
+                border: 1px solid {BORDER};
+                border-radius: 4px;
+            }}
+            QPushButton {{
+                text-align: left;
+                padding-left: 10px;
+            }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+
+        title = QLabel("Откат на предыдущую версию")
+        title.setStyleSheet(f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 11pt;")
+        layout.addWidget(title)
+
+        for tag, url in candidates[:10]:
+            btn = QPushButton(f"↩ {tag}")
+            btn.clicked.connect(lambda checked=False, t=tag, u=url: self._choose(t, u))
+            layout.addWidget(btn)
+
+        hint = QLabel("Выберите версию для отката")
+        hint.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 9pt;")
+        layout.addWidget(hint)
+
+        self.adjustSize()
+        pos = anchor_widget.mapToGlobal(anchor_widget.rect().bottomLeft())
+        self.move(pos.x() - 40, pos.y() + 2)
+
+    def _choose(self, tag: str, url: str):
+        self.version_chosen.emit(url, tag)
+        self.close()
+
+
 # ---------------- Main selector window ----------------
 class MainWindow(QMainWindow):
+    def _on_ui(self, func):
+        QTimer.singleShot(0, func)
+
     def __init__(self):
         super().__init__()
         uic_path = get_resource_path("ui/main_window.ui")
         uic.loadUi(str(uic_path), self)
 
         self.setWindowOpacity(0.93)
+        self._rollback_popup: Optional[RollbackPopup] = None
+        icon_path = get_resource_path("icon_cat.ico")
         try:
-            self.setWindowIcon(QIcon(str(get_resource_path("icon_cat.ico"))))
+            self.setWindowIcon(QIcon(str(icon_path)))
+            pix = QPixmap(str(icon_path)).scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.appIconLabel.setPixmap(pix)
         except Exception:
             pass
 
         self.setStyleSheet(get_app_stylesheet())
         self.setWindowTitle(f"{APP_DISPLAY_NAME} v{APP_VERSION}")
+        self.setFixedSize(800, 600)
 
-        # Small update button (corner, not prominent)
+        self.rollback_btn = QPushButton("↩", self)
+        self.rollback_btn.setObjectName("smallUpdateBtn")
+        self.rollback_btn.setToolTip("Откат на предыдущую версию")
+        self.rollback_btn.setFixedSize(26, 22)
+        self.rollback_btn.clicked.connect(self._show_rollback_versions)
+
         self.update_btn = QPushButton("↻", self)
         self.update_btn.setObjectName("smallUpdateBtn")
         self.update_btn.setToolTip("Проверить обновления")
         self.update_btn.setFixedSize(26, 22)
         self.update_btn.clicked.connect(lambda: self._check_for_updates(silent=False))
 
-        # Place it in header (top-right corner of headerFrame)
         try:
             hl = self.headerFrame.layout()
             if hl:
+                hl.addWidget(self.rollback_btn)
                 hl.addWidget(self.update_btn)
         except Exception:
-            # Fallback: bottom right-ish
-            self.update_btn.move(self.width() - 40, self.height() - 30)
+            self.update_btn.move(self.width() - 40, 8)
+            self.rollback_btn.move(self.width() - 70, 8)
 
-        # Populate lab buttons (exactly 1 functional + placeholders)
         self._populate_lab_buttons()
-
-        # Auto silent update check (like MolPlayer)
         QTimer.singleShot(8000, lambda: self._check_for_updates(silent=True))
-
         self.statusbar.showMessage("Готов. Выберите лабораторную работу.")
 
     def _populate_lab_buttons(self):
@@ -532,13 +615,14 @@ class MainWindow(QMainWindow):
         # Real lab 1
         btn1 = QPushButton("1. Оценка концентрации вещества рентгеноабсорбционным методом")
         btn1.setMinimumHeight(42)
+        btn1.setMaximumHeight(42)
         btn1.clicked.connect(self._open_lab1)
         layout.addWidget(btn1)
 
-        # Placeholders for future labs (as discussed)
-        for i in range(2, 5):
+        for i in range(2, 11):
             b = QPushButton(f"{i}. (в разработке)")
             b.setMinimumHeight(42)
+            b.setMaximumHeight(42)
             b.setEnabled(False)
             b.setStyleSheet(f"QPushButton {{ background-color: {BG_TRACK}; color: {TEXT_MUTED}; }}")
             layout.addWidget(b)
@@ -553,58 +637,120 @@ class MainWindow(QMainWindow):
         lab = Lab1Window(self)
         lab.show()
 
-    # ---------------- Self-update (adapted from MolPlayer) ----------------
+    def _show_rollback_versions(self):
+        if self._rollback_popup and self._rollback_popup.isVisible():
+            self._rollback_popup.close()
+            self._rollback_popup = None
+            return
+
+        def worker():
+            try:
+                api = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
+                req = urllib.request.Request(api, headers={"User-Agent": f"{APP_NAME}-Updater/1.0"})
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    releases = json.loads(resp.read().decode("utf-8"))
+
+                current = ver_tuple(APP_VERSION)
+                candidates = []
+                for rel in releases:
+                    tag = rel.get("tag_name", "")
+                    if not tag or ver_tuple(tag) >= current:
+                        continue
+                    url = find_portable_asset_url(rel)
+                    if url:
+                        candidates.append((tag, url))
+
+                if not candidates:
+                    self._on_ui(lambda: QMessageBox.information(
+                        self, "Откат версии",
+                        "Нет доступных предыдущих версий с portable-архивом на GitHub."
+                    ))
+                    return
+
+                candidates.sort(key=lambda c: ver_tuple(c[0]), reverse=True)
+
+                def show_popup(cands=candidates):
+                    self._rollback_popup = RollbackPopup(self, cands, self.rollback_btn)
+                    self._rollback_popup.version_chosen.connect(self._do_rollback)
+                    self._rollback_popup.show()
+
+                self._on_ui(show_popup)
+            except Exception as e:
+                self._on_ui(lambda: QMessageBox.warning(
+                    self, "Ошибка отката", f"Не удалось получить список версий:\n{e}"
+                ))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _do_rollback(self, asset_url: str, tag: str):
+        self._rollback_popup = None
+        if QMessageBox.question(
+            self, "Подтверждение отката",
+            f"Откатиться на {tag}?\n\n"
+            "Файлы приложения будут заменены на версию из архива.\n"
+            "Приложение автоматически перезапустится."
+        ) != QMessageBox.Yes:
+            return
+        self._perform_self_update(asset_url, tag)
+
     def _check_for_updates(self, silent: bool = False):
         def worker():
             try:
                 api = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
                 req = urllib.request.Request(api, headers={"User-Agent": f"{APP_NAME}-Updater/1.0"})
-                with urllib.request.urlopen(req, timeout=12) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+                try:
+                    with urllib.request.urlopen(req, timeout=12) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                except urllib.error.HTTPError as http_err:
+                    if http_err.code == 404:
+                        if not silent:
+                            self._on_ui(lambda: QMessageBox.information(
+                                self, "Обновления",
+                                "На GitHub пока нет опубликованных релизов.\n\n"
+                                "Создайте Release v0.0.1 и загрузите Xray_labs-portable.zip."
+                            ))
+                        return
+                    if not silent:
+                        self._on_ui(lambda: QMessageBox.warning(
+                            self, "Обновления", f"Ошибка GitHub: {http_err}"
+                        ))
+                    return
 
                 latest_tag = data.get("tag_name", "v0.0.0")
-
-                asset_url = None
-                for asset in data.get("assets", []):
-                    name = asset.get("name", "")
-                    if "portable" in name.lower() and name.endswith(".zip"):
-                        asset_url = asset.get("browser_download_url")
-                        break
-                if not asset_url:
-                    for asset in data.get("assets", []):
-                        if asset.get("name", "").endswith(".zip"):
-                            asset_url = asset.get("browser_download_url")
-                            break
+                asset_url = find_portable_asset_url(data)
 
                 if not asset_url:
                     if not silent:
-                        QMessageBox.information(self, "Обновления", "В релизе не найден подходящий portable zip.")
+                        self._on_ui(lambda: QMessageBox.information(
+                            self, "Обновления", "В релизе не найден portable zip."
+                        ))
                     return
-
-                def ver_tuple(v: str):
-                    v = v.lstrip("vV")
-                    try:
-                        return tuple(int(x) for x in v.split(".")[:3])
-                    except Exception:
-                        return (0, 0, 0)
 
                 current = ver_tuple(APP_VERSION)
                 latest = ver_tuple(latest_tag)
 
                 if latest <= current:
                     if not silent:
-                        QMessageBox.information(self, "Обновления", f"У вас уже последняя версия ({APP_VERSION}).")
+                        self._on_ui(lambda: QMessageBox.information(
+                            self, "Обновления", f"У вас уже последняя версия ({APP_VERSION})."
+                        ))
                     return
 
-                if QMessageBox.question(
-                    self, "Доступно обновление",
-                    f"Доступна новая версия {latest_tag} (у вас {APP_VERSION}).\n\nЗагрузить и установить сейчас?"
-                ) == QMessageBox.Yes:
-                    self._perform_self_update(asset_url, latest_tag)
+                def ask_update(url=asset_url, tag=latest_tag):
+                    if QMessageBox.question(
+                        self, "Доступно обновление",
+                        f"Доступна новая версия {tag} (у вас {APP_VERSION}).\n\n"
+                        "Загрузить и установить сейчас?"
+                    ) == QMessageBox.Yes:
+                        self._perform_self_update(url, tag)
+
+                self._on_ui(ask_update)
 
             except Exception as e:
                 if not silent:
-                    QMessageBox.warning(self, "Обновления", f"Не удалось проверить обновления:\n{e}")
+                    self._on_ui(lambda: QMessageBox.warning(
+                        self, "Обновления", f"Не удалось проверить обновления:\n{e}"
+                    ))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -645,11 +791,11 @@ del "%~f0" >nul 2>&1
                 with open(bat, "w", encoding="cp866") as f:
                     f.write(bat_content)
 
-                progress.close()
-                self._launch_updater(bat)
+                self._on_ui(progress.close)
+                self._on_ui(lambda: self._launch_updater(bat))
             except Exception as ex:
-                progress.close()
-                QMessageBox.critical(self, "Ошибка обновления", str(ex))
+                self._on_ui(progress.close)
+                self._on_ui(lambda: QMessageBox.critical(self, "Ошибка обновления", str(ex)))
 
         threading.Thread(target=worker, daemon=True).start()
 
