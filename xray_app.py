@@ -1,5 +1,5 @@
 """
-X-Ray-lab v0.0.4
+X-Ray-lab v0.0.5
 PyQt5 + editable .ui files (open in Qt Designer).
 Color scheme from MolPlayer/constants.py (Laby.docx palette).
 """
@@ -20,7 +20,7 @@ from collections import deque
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageFilter
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QMessageBox, QFileDialog, QGraphicsScene,
@@ -31,7 +31,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import (
     QPixmap, QImage, QPen, QColor, QIcon, QPainter, QDesktopServices, QPolygonF
 )
-from PyQt5.QtCore import Qt, QEvent, QPointF, QRectF, QTimer, pyqtSignal, QUrl
+from PyQt5.QtCore import Qt, QEvent, QPointF, QRectF, QTimer, pyqtSignal, pyqtSlot, QUrl
 from PyQt5 import uic
 
 from constants import (
@@ -92,7 +92,8 @@ def square_corners_from_diagonal(
         return None
     cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
     wx, wy = -(y2 - y1) / d, (x2 - x1) / d
-    off = d / (2.0 * math.sqrt(2.0))
+    # Both diagonals of a square have the same length and cross in the middle.
+    off = d / 2.0
     return [
         (x1, y1),
         (cx + wx * off, cy + wy * off),
@@ -141,20 +142,113 @@ def connected_component_areas(mask: bytearray, width: int, height: int) -> List[
     return result
 
 
+def filter_inclusion_components(
+    mask: bytearray,
+    roi_mask: bytearray,
+    width: int,
+    height: int,
+    min_area: int = 2,
+    grayscale: Optional[Image.Image] = None,
+    min_surrounding_contrast: float = 8.0,
+) -> Tuple[bytearray, List[int]]:
+    """Keep compact dark spots surrounded by brighter pixels in every direction."""
+    remaining = bytearray(mask)
+    filtered = bytearray(width * height)
+    areas: List[int] = []
+    gray_pixels = grayscale.load() if grayscale is not None else None
+
+    for start in range(width * height):
+        if not remaining[start]:
+            continue
+        remaining[start] = 0
+        queue = deque([start])
+        component: List[int] = []
+        touches_boundary = False
+        while queue:
+            index = queue.popleft()
+            component.append(index)
+            x = index % width
+            y = index // width
+
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                    touches_boundary = True
+                elif not roi_mask[ny * width + nx]:
+                    touches_boundary = True
+
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                row = ny * width
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    neighbor = row + nx
+                    if remaining[neighbor]:
+                        remaining[neighbor] = 0
+                        queue.append(neighbor)
+
+        surrounded = True
+        if gray_pixels is not None and component:
+            xs = [index % width for index in component]
+            ys = [index // width for index in component]
+            center_x = round(sum(xs) / len(xs))
+            center_y = round(sum(ys) / len(ys))
+            box_width = max(xs) - min(xs) + 1
+            box_height = max(ys) - min(ys) + 1
+            radius = max(5, max(box_width, box_height) + 2)
+            component_values = sorted(gray_pixels[index % width, index // width] for index in component)
+            dark_half = component_values[:max(1, len(component_values) // 2)]
+            center_value = sum(dark_half) / len(dark_half)
+            brighter_directions = 0
+            for dx, dy in (
+                (1, 0), (-1, 0), (0, 1), (0, -1),
+                (1, 1), (1, -1), (-1, 1), (-1, -1),
+            ):
+                sample_x = center_x + dx * radius
+                sample_y = center_y + dy * radius
+                if not (0 <= sample_x < width and 0 <= sample_y < height):
+                    continue
+                if not roi_mask[sample_y * width + sample_x]:
+                    continue
+                patch = []
+                for py in range(max(0, sample_y - 1), min(height, sample_y + 2)):
+                    for px in range(max(0, sample_x - 1), min(width, sample_x + 2)):
+                        if roi_mask[py * width + px]:
+                            patch.append(gray_pixels[px, py])
+                if patch and sum(patch) / len(patch) - center_value >= min_surrounding_contrast:
+                    brighter_directions += 1
+            surrounded = brighter_directions >= 7
+
+        if len(component) >= min_area and not touches_boundary and surrounded:
+            areas.append(len(component))
+            for index in component:
+                filtered[index] = 1
+
+    return filtered, areas
+
+
+def histogram_percentile(histogram: List[int], percentile: float) -> int:
+    total = sum(histogram)
+    if total <= 0:
+        return 0
+    target = max(1, math.ceil(total * percentile))
+    cumulative = 0
+    for value, count in enumerate(histogram):
+        cumulative += count
+        if cumulative >= target:
+            return value
+    return len(histogram) - 1
+
+
 def process_inclusions(
     original: Image.Image,
     line_points: Optional[Tuple[Tuple[int, int], Tuple[int, int]]],
     container_type: str,   # "square" or "cylinder"
-    threshold: int = 95
+    contrast_threshold: Optional[int] = None,
 ) -> Tuple[Image.Image, Image.Image, int, List[int]]:
     """
     Returns (original_rgb, processed_rgb, white_pixel_count_inside_mask,
     connected_component_areas_px).
-    Processing per spec + user answer (show рядом):
-      - Outside ROI: gray
-      - Inside container shape: black base
-      - Bright/dark spots inside (inclusions): white
-    Simple threshold for demo. Count white pixels inside ROI for area.
+    Dark inclusions are detected relative to a blurred local background. This
+    suppresses broad exposure gradients and unevenly illuminated corners.
+    The returned processed image keeps the original and highlights findings.
     """
     if original.mode != "L":
         gray = original.convert("L")
@@ -183,14 +277,7 @@ def process_inclusions(
             cy = (y1 + y2) / 2.0
             circle_params = (cx, cy, length / 2.0)
 
-    processed = Image.new("RGB", (w, h), (128, 128, 128))  # outside = gray
-    white_count = 0
-    inclusion_mask = bytearray(w * h)
-
-    orig_pixels = orig_rgb.load()
-    gray_pixels = gray.load()
-    proc_pixels = processed.load()
-
+    roi_mask = bytearray(w * h)
     for y in range(h):
         for x in range(w):
             in_roi = True
@@ -200,20 +287,46 @@ def process_inclusions(
                 cx, cy, r = circle_params
                 in_roi = (x - cx) ** 2 + (y - cy) ** 2 <= r * r
 
-            g = gray_pixels[x, y]
+            if in_roi:
+                roi_mask[y * w + x] = 255
 
-            if not in_roi:
-                proc_pixels[x, y] = (128, 128, 128)
-            else:
-                # Inside container shape: black base + white for inclusions
-                if g < threshold:
-                    proc_pixels[x, y] = (255, 255, 255)  # inclusion
-                    white_count += 1
-                    inclusion_mask[y * w + x] = 1
-                else:
-                    proc_pixels[x, y] = (20, 20, 20)  # container / matrix black
+    spot_window = max(9, min(21, 2 * round(min(w, h) / 80) + 1))
+    local_background = gray.filter(ImageFilter.MaxFilter(spot_window)).filter(
+        ImageFilter.MinFilter(spot_window)
+    )
+    local_contrast = ImageChops.subtract(local_background, gray)
+    roi_image = Image.frombytes("L", (w, h), bytes(roi_mask))
+    histogram = local_contrast.histogram(mask=roi_image)
+    median = histogram_percentile(histogram, 0.5)
+    deviation_histogram = [0] * 256
+    for value, count in enumerate(histogram):
+        deviation_histogram[abs(value - median)] += count
+    mad = histogram_percentile(deviation_histogram, 0.5)
+    threshold = contrast_threshold or max(18, round(median + 4.5 * 1.4826 * mad))
 
-    return orig_rgb, processed, white_count, connected_component_areas(inclusion_mask, w, h)
+    contrast_pixels = local_contrast.load()
+    raw_mask = bytearray(w * h)
+    binary_roi = bytearray(1 if value else 0 for value in roi_mask)
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            if binary_roi[row + x] and contrast_pixels[x, y] >= threshold:
+                raw_mask[row + x] = 1
+
+    inclusion_mask, component_areas = filter_inclusion_components(
+        raw_mask, binary_roi, w, h, grayscale=gray
+    )
+    white_count = sum(component_areas)
+
+    # Enlarge only the visual marker; volume calculations use the original mask.
+    marker = Image.frombytes(
+        "L", (w, h), bytes(255 if value else 0 for value in inclusion_mask)
+    ).filter(ImageFilter.MaxFilter(5))
+    marker = ImageChops.multiply(marker, roi_image)
+    cyan = Image.new("RGB", (w, h), (0, 191, 255))
+    processed = Image.composite(cyan, orig_rgb, marker)
+
+    return orig_rgb, processed, white_count, component_areas
 
 # ---------------- Interactive image view (line drawing via eventFilter) ----------------
 # Note: We use plain QGraphicsView from the .ui file + eventFilter on the viewport
@@ -362,7 +475,7 @@ class Lab1Window(QMainWindow):
         uic.loadUi(str(uic_path), self)
 
         self.setWindowOpacity(0.93)
-        self.setFixedSize(1000, 600)
+        self.setFixedSize(1000, 660)
         self.setWindowIcon(QIcon(str(get_resource_path("icon_cat.ico"))))
 
         self.setStyleSheet(get_app_stylesheet())
@@ -603,7 +716,7 @@ class Lab1Window(QMainWindow):
             return False
         ctype = self._get_container_type()
         try:
-            original_rgb, proc, white, component_areas = process_inclusions(
+            _, proc, white, component_areas = process_inclusions(
                 self.original_pil, self.line_points, ctype
             )
             self.white_px_count = white
@@ -612,19 +725,11 @@ class Lab1Window(QMainWindow):
             self._showing_processed = True
             self.current_line_item = None
 
-            original_pix = pil_to_pixmap(original_rgb)
             ppix = pil_to_pixmap(proc)
-            gap = 12
-            result_offset = original_pix.width() + gap
             self.image_scene.clear()
-            original_item = QGraphicsPixmapItem(original_pix)
-            self.image_scene.addItem(original_item)
             pitem = QGraphicsPixmapItem(ppix)
-            pitem.setPos(result_offset, 0)
             self.image_scene.addItem(pitem)
-            self.image_scene.setSceneRect(
-                QRectF(0, 0, result_offset + ppix.width(), max(original_pix.height(), ppix.height()))
-            )
+            self.image_scene.setSceneRect(QRectF(0, 0, ppix.width(), ppix.height()))
 
             if self.line_points:
                 (x1, y1), (x2, y2) = self.line_points
@@ -632,18 +737,14 @@ class Lab1Window(QMainWindow):
                 if ctype == "square":
                     corners = square_corners_from_diagonal(x1, y1, x2, y2)
                     if corners:
-                        poly = QPolygonF([
-                            QPointF(cx + result_offset, cy) for cx, cy in corners
-                        ])
+                        poly = QPolygonF([QPointF(cx, cy) for cx, cy in corners])
                         self.image_scene.addPolygon(poly, pen)
                 else:
                     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
                     r = math.hypot(x2 - x1, y2 - y1) / 2
-                    self.image_scene.addEllipse(
-                        cx + result_offset - r, cy - r, r * 2, r * 2, pen
-                    )
+                    self.image_scene.addEllipse(cx - r, cy - r, r * 2, r * 2, pen)
 
-            self.imageView.fitInView(self.image_scene.itemsBoundingRect(), Qt.KeepAspectRatio)
+            self.imageView.fitInView(pitem, Qt.KeepAspectRatio)
             self._reset_volume_labels()
             return True
         except Exception as e:
@@ -857,11 +958,18 @@ class VersionManagerDialog(QDialog):
 
 # ---------------- Main selector window ----------------
 class MainWindow(QMainWindow):
+    ui_call = pyqtSignal(object)
+
     def _on_ui(self, func):
-        QTimer.singleShot(0, func)
+        self.ui_call.emit(func)
+
+    @pyqtSlot(object)
+    def _run_on_ui(self, callback):
+        callback()
 
     def __init__(self):
         super().__init__()
+        self.ui_call.connect(self._run_on_ui)
         uic_path = get_resource_path("ui/main_window.ui")
         uic.loadUi(str(uic_path), self)
 

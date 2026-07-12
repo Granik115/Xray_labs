@@ -2,14 +2,19 @@ import os
 import tempfile
 import unittest
 import zipfile
+import math
 from pathlib import Path
+
+from PIL import Image
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from xray_app import (
     calc_inclusion_volume_mm3,
     connected_component_areas,
+    process_inclusions,
     safe_extract_zip,
+    square_corners_from_diagonal,
     ver_tuple,
 )
 from constants import APP_VERSION
@@ -17,8 +22,17 @@ from constants import APP_VERSION
 
 class CoreLogicTests(unittest.TestCase):
     def test_version_comparison(self):
-        self.assertGreater(ver_tuple("v0.0.4"), ver_tuple("0.0.3"))
-        self.assertEqual(APP_VERSION, "0.0.4")
+        self.assertGreater(ver_tuple("v0.0.5"), ver_tuple("0.0.4"))
+        self.assertEqual(APP_VERSION, "0.0.5")
+
+    def test_diagonal_defines_a_true_square(self):
+        corners = square_corners_from_diagonal(0, 0, 100, 80)
+        sides = [
+            math.dist(corners[index], corners[(index + 1) % 4])
+            for index in range(4)
+        ]
+        self.assertLess(max(sides) - min(sides), 1e-9)
+        self.assertAlmostEqual(math.dist(corners[0], corners[2]), math.dist(corners[1], corners[3]))
 
     def test_components_are_eight_connected(self):
         mask = bytearray([
@@ -33,6 +47,25 @@ class CoreLogicTests(unittest.TestCase):
         self.assertEqual(cubic, 35.0)
         spherical = calc_inclusion_volume_mm3([4.0, 9.0], "sphere")
         self.assertAlmostEqual(spherical, 4.0 * 35.0 / (3.0 * 3.141592653589793 ** 0.5))
+
+    def test_local_contrast_ignores_smooth_exposure_gradient(self):
+        width = height = 100
+        image = Image.new("L", (width, height))
+        pixels = image.load()
+        for y in range(height):
+            for x in range(width):
+                pixels[x, y] = 70 + x
+        for y in range(48, 52):
+            for x in range(48, 52):
+                pixels[x, y] = max(0, pixels[x, y] - 55)
+
+        _, overlay, white_count, component_areas = process_inclusions(
+            image, ((0, 0), (99, 99)), "square", contrast_threshold=10
+        )
+        self.assertGreaterEqual(white_count, 12)
+        self.assertLess(white_count, 30)
+        self.assertEqual(sum(component_areas), white_count)
+        self.assertEqual(overlay.getpixel((50, 50)), (0, 191, 255))
 
     def test_safe_extract_rejects_path_traversal(self):
         with tempfile.TemporaryDirectory() as temp:

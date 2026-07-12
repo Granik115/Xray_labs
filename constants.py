@@ -52,7 +52,7 @@ ACCENT_CYAN = ACCENT_GLOW
 # App info
 APP_NAME = "Xray_labs"
 APP_DISPLAY_NAME = "X-Ray-lab"
-APP_VERSION = "0.0.4"
+APP_VERSION = "0.0.5"
 VERSION = APP_VERSION
 
 # For self-updater (must match GitHub repo)
@@ -166,6 +166,25 @@ QLabel#resultLabel {{
 QGraphicsView {{
     background-color: #2a2f38;
     border: 1px solid {BORDER};
+}}
+
+QTableWidget, QTextBrowser {{
+    background-color: {BG_DARK};
+    color: {TEXT_PRIMARY};
+    border: 1px solid {BORDER};
+    gridline-color: {BORDER};
+    selection-background-color: {ACCENT_FRAME};
+    selection-color: {TEXT_PRIMARY};
+}}
+
+QHeaderView::section {{
+    background-color: {BG_TRACK_SELECTED};
+    color: {TEXT_PRIMARY};
+    border: none;
+    border-right: 1px solid {BORDER};
+    border-bottom: 1px solid {BORDER};
+    padding: 6px 8px;
+    font-weight: bold;
 }}
 
 QScrollBar:vertical {{
