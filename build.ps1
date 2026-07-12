@@ -7,7 +7,12 @@ Write-Host "=== X-Ray-lab PyInstaller build ===" -ForegroundColor Cyan
 
 python -m pip install -r requirements.txt --quiet
 
-$version = "0.0.3"
+$constants = Get-Content "constants.py" -Raw
+$versionMatch = [regex]::Match($constants, 'APP_VERSION\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"')
+if (-not $versionMatch.Success) {
+    throw "APP_VERSION not found in constants.py"
+}
+$version = $versionMatch.Groups[1].Value
 
 $dist = "dist"
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }

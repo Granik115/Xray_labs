@@ -1,5 +1,5 @@
 """
-X-Ray-lab v0.0.3
+X-Ray-lab v0.0.4
 PyQt5 + editable .ui files (open in Qt Designer).
 Color scheme from MolPlayer/constants.py (Laby.docx palette).
 """
@@ -8,6 +8,7 @@ import sys
 import os
 import json
 import math
+import hashlib
 import tempfile
 import urllib.request
 import urllib.error
@@ -15,6 +16,7 @@ import zipfile
 import shutil
 import subprocess
 import threading
+from collections import deque
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -22,14 +24,14 @@ from PIL import Image
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QMessageBox, QFileDialog, QGraphicsScene,
-    QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsEllipseItem, QGraphicsPolygonItem,
-    QGraphicsView, QVBoxLayout, QHBoxLayout, QButtonGroup,
-    QPushButton, QRadioButton, QLabel, QLineEdit, QFrame, QWidget
+    QGraphicsPixmapItem, QGraphicsLineItem, QVBoxLayout, QHBoxLayout, QButtonGroup,
+    QPushButton, QLabel, QDialog,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QTextBrowser
 )
 from PyQt5.QtGui import (
-    QPixmap, QImage, QPen, QColor, QBrush, QFont, QIcon, QPainter, QDesktopServices, QPolygonF
+    QPixmap, QImage, QPen, QColor, QIcon, QPainter, QDesktopServices, QPolygonF
 )
-from PyQt5.QtCore import Qt, QEvent, QPointF, QRectF, QTimer, pyqtSignal, QObject, QUrl
+from PyQt5.QtCore import Qt, QEvent, QPointF, QRectF, QTimer, pyqtSignal, QUrl
 from PyQt5 import uic
 
 from constants import (
@@ -112,14 +114,42 @@ def point_in_polygon(px: float, py: float, poly: List[Tuple[float, float]]) -> b
     return inside
 
 
+def connected_component_areas(mask: bytearray, width: int, height: int) -> List[int]:
+    """Return 8-connected white component areas without modifying the source mask."""
+    remaining = bytearray(mask)
+    result: List[int] = []
+
+    for start in range(width * height):
+        if not remaining[start]:
+            continue
+        remaining[start] = 0
+        queue = deque([start])
+        area = 0
+        while queue:
+            index = queue.popleft()
+            area += 1
+            x = index % width
+            y = index // width
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                row = ny * width
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    neighbor = row + nx
+                    if remaining[neighbor]:
+                        remaining[neighbor] = 0
+                        queue.append(neighbor)
+        result.append(area)
+    return result
+
+
 def process_inclusions(
     original: Image.Image,
     line_points: Optional[Tuple[Tuple[int, int], Tuple[int, int]]],
     container_type: str,   # "square" or "cylinder"
     threshold: int = 95
-) -> Tuple[Image.Image, Image.Image, int]:
+) -> Tuple[Image.Image, Image.Image, int, List[int]]:
     """
-    Returns (original_rgb, processed_rgb, white_pixel_count_inside_mask)
+    Returns (original_rgb, processed_rgb, white_pixel_count_inside_mask,
+    connected_component_areas_px).
     Processing per spec + user answer (show рядом):
       - Outside ROI: gray
       - Inside container shape: black base
@@ -155,6 +185,7 @@ def process_inclusions(
 
     processed = Image.new("RGB", (w, h), (128, 128, 128))  # outside = gray
     white_count = 0
+    inclusion_mask = bytearray(w * h)
 
     orig_pixels = orig_rgb.load()
     gray_pixels = gray.load()
@@ -178,10 +209,11 @@ def process_inclusions(
                 if g < threshold:
                     proc_pixels[x, y] = (255, 255, 255)  # inclusion
                     white_count += 1
+                    inclusion_mask[y * w + x] = 1
                 else:
                     proc_pixels[x, y] = (20, 20, 20)  # container / matrix black
 
-    return orig_rgb, processed, white_count
+    return orig_rgb, processed, white_count, connected_component_areas(inclusion_mask, w, h)
 
 # ---------------- Interactive image view (line drawing via eventFilter) ----------------
 # Note: We use plain QGraphicsView from the .ui file + eventFilter on the viewport
@@ -207,7 +239,10 @@ def github_request(url: str, timeout: int = 30) -> bytes:
         return resp.read()
 
 
-def download_release_asset(url: str, dest_path: str):
+def download_release_asset(asset: dict, dest_path: str):
+    url = asset.get("browser_download_url")
+    if not url:
+        raise ValueError("У файла релиза отсутствует ссылка для скачивания")
     req = urllib.request.Request(
         url,
         headers={"User-Agent": f"{APP_NAME}-Updater/{APP_VERSION}"},
@@ -216,30 +251,72 @@ def download_release_asset(url: str, dest_path: str):
         with open(dest_path, "wb") as out:
             shutil.copyfileobj(resp, out)
 
+    digest = asset.get("digest", "")
+    if digest.startswith("sha256:"):
+        expected = digest.split(":", 1)[1].lower()
+        sha256 = hashlib.sha256()
+        with open(dest_path, "rb") as downloaded:
+            for chunk in iter(lambda: downloaded.read(1024 * 1024), b""):
+                sha256.update(chunk)
+        if sha256.hexdigest().lower() != expected:
+            os.remove(dest_path)
+            raise ValueError("Контрольная сумма скачанного файла не совпала")
 
-def find_portable_asset_url(release_data: dict) -> Optional[str]:
+
+def safe_extract_zip(zip_path: str, dest_dir: str):
+    """Extract a release archive while rejecting traversal and symlink entries."""
+    destination = Path(dest_dir).resolve()
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        for info in archive.infolist():
+            member = Path(info.filename)
+            target = (destination / member).resolve()
+            if member.is_absolute() or destination not in target.parents and target != destination:
+                raise ValueError(f"Недопустимый путь в архиве: {info.filename}")
+            if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                raise ValueError(f"Символические ссылки в обновлении запрещены: {info.filename}")
+        archive.extractall(destination)
+
+
+def find_portable_asset(release_data: dict) -> Optional[dict]:
     assets = release_data.get("assets", [])
     versioned = []
     generic = []
     other = []
     for asset in assets:
         name = asset.get("name", "")
-        url = asset.get("browser_download_url")
-        if not url or not name.endswith(".zip"):
+        if not asset.get("browser_download_url") or not name.lower().endswith(".zip"):
             continue
         low = name.lower()
         if "portable" in low and "-v" in low:
-            versioned.append(url)
+            versioned.append(asset)
         elif low == "xray_labs-portable.zip":
-            generic.append(url)
+            generic.append(asset)
         elif "portable" in low:
-            other.append(url)
+            other.append(asset)
         else:
-            other.append(url)
+            other.append(asset)
     for bucket in (versioned, generic, other):
         if bucket:
             return bucket[0]
     return None
+
+
+def find_setup_asset(release_data: dict) -> Optional[dict]:
+    for asset in release_data.get("assets", []):
+        name = asset.get("name", "").lower()
+        if name.endswith("-setup.exe") and asset.get("browser_download_url"):
+            return asset
+    return None
+
+
+def get_release_install_mode() -> str:
+    """Installed builds use the installer; unpacked builds update in place."""
+    if not getattr(sys, "frozen", False):
+        return "installer"
+    app_dir = Path(get_app_install_dir())
+    if any(app_dir.glob("unins*.exe")):
+        return "installer"
+    return "portable"
 
 
 def get_app_install_dir() -> str:
@@ -258,14 +335,15 @@ def find_extracted_app_dir(extract_dir: str) -> str:
     return extract_dir
 
 
-def calc_inclusion_volume_mm3(area_mm2: float, thick_mm: float, incl_type: str) -> float:
-    """Объём включений по типу частиц (стереологическая аппроксимация из 2D-площади)."""
-    if area_mm2 <= 0 or thick_mm <= 0:
+def calc_inclusion_volume_mm3(component_areas_mm2: List[float], incl_type: str) -> float:
+    """Volume from each connected inclusion area according to Laby.docx."""
+    areas = [area for area in component_areas_mm2 if area > 0]
+    if not areas:
         return 0.0
+    summed = sum(area ** 1.5 for area in areas)
     if incl_type == "cubic":
-        return area_mm2 * thick_mm
-    # шарообразные: V = (4/3)*pi*r^3 при S = pi*r^2 => V = (4/(3*sqrt(pi))) * S^(3/2)
-    return (4.0 / (3.0 * math.sqrt(math.pi))) * (area_mm2 ** 1.5)
+        return summed
+    return (4.0 / (3.0 * math.sqrt(math.pi))) * summed
 
 
 def make_pen(color: str = "#00bfff", width: int = 3) -> QPen:
@@ -294,6 +372,8 @@ class Lab1Window(QMainWindow):
         self.line_points: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
         self.current_line_item: Optional[QGraphicsLineItem] = None
         self.white_px_count: int = 0
+        self.component_px_areas: List[int] = []
+        self._processed_signature = None
         self._dragging_line = False
         self._line_start: Optional[QPointF] = None
         self._showing_processed = False
@@ -366,6 +446,9 @@ class Lab1Window(QMainWindow):
             return
         self._update_instruction()
         self.white_px_count = 0
+        self.component_px_areas = []
+        self._processed_signature = None
+        self._reset_volume_labels()
         if self._showing_processed and self.original_pil is not None:
             self._showing_processed = False
             pix = pil_to_pixmap(self.original_pil)
@@ -450,6 +533,10 @@ class Lab1Window(QMainWindow):
                 x1, y1 = int(start.x()), int(start.y())
                 x2, y2 = int(end.x()), int(end.y())
                 self.line_points = ((x1, y1), (x2, y2))
+                self.white_px_count = 0
+                self.component_px_areas = []
+                self._processed_signature = None
+                self._reset_volume_labels()
                 return True
 
         return super().eventFilter(obj, event)
@@ -489,6 +576,8 @@ class Lab1Window(QMainWindow):
             self.line_points = None
             self.current_line_item = None
             self.white_px_count = 0
+            self.component_px_areas = []
+            self._processed_signature = None
             self._showing_processed = False
             self._reset_volume_labels()
 
@@ -505,19 +594,37 @@ class Lab1Window(QMainWindow):
     def _find_inclusions(self):
         if self.original_pil is None:
             QMessageBox.information(self, "Нет снимка", "Сначала откройте файл.")
-            return
+            return False
+        if self.line_points is None:
+            QMessageBox.information(
+                self, "Не задан контейнер",
+                "Сначала проведите на снимке диагональ квадрата или диаметр цилиндра."
+            )
+            return False
         ctype = self._get_container_type()
         try:
-            _, proc, white = process_inclusions(self.original_pil, self.line_points, ctype)
+            original_rgb, proc, white, component_areas = process_inclusions(
+                self.original_pil, self.line_points, ctype
+            )
             self.white_px_count = white
+            self.component_px_areas = component_areas
+            self._processed_signature = (self.line_points, ctype)
             self._showing_processed = True
             self.current_line_item = None
 
+            original_pix = pil_to_pixmap(original_rgb)
             ppix = pil_to_pixmap(proc)
+            gap = 12
+            result_offset = original_pix.width() + gap
             self.image_scene.clear()
+            original_item = QGraphicsPixmapItem(original_pix)
+            self.image_scene.addItem(original_item)
             pitem = QGraphicsPixmapItem(ppix)
+            pitem.setPos(result_offset, 0)
             self.image_scene.addItem(pitem)
-            self.image_scene.setSceneRect(QRectF(0, 0, ppix.width(), ppix.height()))
+            self.image_scene.setSceneRect(
+                QRectF(0, 0, result_offset + ppix.width(), max(original_pix.height(), ppix.height()))
+            )
 
             if self.line_points:
                 (x1, y1), (x2, y2) = self.line_points
@@ -525,16 +632,23 @@ class Lab1Window(QMainWindow):
                 if ctype == "square":
                     corners = square_corners_from_diagonal(x1, y1, x2, y2)
                     if corners:
-                        poly = QPolygonF([QPointF(cx, cy) for cx, cy in corners])
+                        poly = QPolygonF([
+                            QPointF(cx + result_offset, cy) for cx, cy in corners
+                        ])
                         self.image_scene.addPolygon(poly, pen)
                 else:
                     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
                     r = math.hypot(x2 - x1, y2 - y1) / 2
-                    self.image_scene.addEllipse(cx - r, cy - r, r * 2, r * 2, pen)
+                    self.image_scene.addEllipse(
+                        cx + result_offset - r, cy - r, r * 2, r * 2, pen
+                    )
 
-            self.imageView.fitInView(pitem, Qt.KeepAspectRatio)
+            self.imageView.fitInView(self.image_scene.itemsBoundingRect(), Qt.KeepAspectRatio)
+            self._reset_volume_labels()
+            return True
         except Exception as e:
             QMessageBox.critical(self, "Ошибка обработки", str(e))
+            return False
 
     def _calculate_volumes(self):
         if self.original_pil is None:
@@ -571,9 +685,13 @@ class Lab1Window(QMainWindow):
         # real_size: диагональ (квадрат) или диаметр (цилиндр) в мм
         scale_mm_per_px = real_size / px_len
 
-        if self.white_px_count <= 0:
-            self._find_inclusions()
-        area_mm2 = self.white_px_count * (scale_mm_per_px ** 2)
+        signature = (self.line_points, ctype)
+        if self._processed_signature != signature:
+            if not self._find_inclusions():
+                return
+        component_areas_mm2 = [
+            area_px * (scale_mm_per_px ** 2) for area_px in self.component_px_areas
+        ]
 
         if ctype == "square":
             side_mm = real_size / math.sqrt(2.0)
@@ -583,7 +701,7 @@ class Lab1Window(QMainWindow):
             container_mm3 = math.pi * r * r * thick
 
         incl_type = "cubic" if self.cubicRadio.isChecked() else "sphere"
-        incl_mm3 = calc_inclusion_volume_mm3(area_mm2, thick, incl_type)
+        incl_mm3 = calc_inclusion_volume_mm3(component_areas_mm2, incl_type)
         poroda_mm3 = max(0.0, container_mm3 - incl_mm3)
 
         poroda_cm3 = poroda_mm3 / 1000.0
@@ -610,49 +728,131 @@ class Lab1Window(QMainWindow):
         super().closeEvent(event)
 
 
-# ---------------- Rollback popup (PyQt version of MolPlayer popup) ----------------
-class RollbackPopup(QFrame):
-    version_chosen = pyqtSignal(str, str)
+# ---------------- Version manager ----------------
+class VersionManagerDialog(QDialog):
+    install_requested = pyqtSignal(object)
 
-    def __init__(self, parent, candidates: list, anchor_widget: QWidget):
-        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
-        self.setObjectName("rollbackPopup")
-        self.setStyleSheet(f"""
-            QFrame#rollbackPopup {{
-                background-color: {BG_PANEL};
-                border: 1px solid {BORDER};
-                border-radius: 4px;
-            }}
-            QPushButton {{
-                text-align: left;
-                padding-left: 10px;
-            }}
-        """)
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Версии X-Ray-lab")
+        self.setWindowIcon(QIcon(str(get_resource_path("icon_cat.ico"))))
+        self.setMinimumSize(720, 500)
+        self.setStyleSheet(get_app_stylesheet())
+        self._releases: List[dict] = []
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(4)
+        mode = "установщик" if get_release_install_mode() == "installer" else "portable-обновление"
+        self.statusLabel = QLabel(
+            f"Установлена версия {APP_VERSION}. Режим обновления: {mode}."
+        )
+        self.statusLabel.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        layout.addWidget(self.statusLabel)
 
-        title = QLabel("Откат на предыдущую версию")
-        title.setStyleSheet(f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 11pt;")
-        layout.addWidget(title)
+        self.table = QTableWidget(0, 4, self)
+        self.table.setHorizontalHeaderLabels(["Версия", "Дата", "Статус", "Пакет"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.table.itemSelectionChanged.connect(self._selection_changed)
+        layout.addWidget(self.table, 1)
 
-        for tag, url in candidates[:10]:
-            btn = QPushButton(f"↩ {tag}")
-            btn.clicked.connect(lambda checked=False, t=tag, u=url: self._choose(t, u))
-            layout.addWidget(btn)
+        self.notes = QTextBrowser(self)
+        self.notes.setMaximumHeight(150)
+        self.notes.setPlaceholderText("Здесь появится описание выбранного релиза")
+        layout.addWidget(self.notes)
 
-        hint = QLabel("Выберите версию для отката")
-        hint.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 9pt;")
-        layout.addWidget(hint)
+        buttons = QHBoxLayout()
+        self.openReleaseBtn = QPushButton("Открыть на GitHub")
+        self.openReleaseBtn.setEnabled(False)
+        self.openReleaseBtn.clicked.connect(self._open_release)
+        buttons.addWidget(self.openReleaseBtn)
+        buttons.addStretch(1)
+        self.installBtn = QPushButton("Установить выбранную")
+        self.installBtn.setEnabled(False)
+        self.installBtn.clicked.connect(self._request_install)
+        buttons.addWidget(self.installBtn)
+        close_btn = QPushButton("Закрыть")
+        close_btn.clicked.connect(self.close)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
 
-        self.adjustSize()
-        pos = anchor_widget.mapToGlobal(anchor_widget.rect().bottomLeft())
-        self.move(pos.x() - 40, pos.y() + 2)
+    def show_loading(self):
+        self.statusLabel.setText("Получаю список версий с GitHub…")
+        self.table.setRowCount(0)
+        self.installBtn.setEnabled(False)
 
-    def _choose(self, tag: str, url: str):
-        self.version_chosen.emit(url, tag)
-        self.close()
+    def show_error(self, message: str):
+        self.statusLabel.setText("Не удалось получить список версий.")
+        QMessageBox.warning(self, "Версии", message)
+
+    def set_releases(self, releases: List[dict]):
+        self._releases = sorted(
+            [release for release in releases if not release.get("draft")],
+            key=lambda release: ver_tuple(release.get("tag_name", "")),
+            reverse=True,
+        )
+        self.table.setRowCount(len(self._releases))
+        for row, release in enumerate(self._releases):
+            tag = release.get("tag_name", "?")
+            version = tag.lstrip("vV")
+            comparison = ver_tuple(version)
+            if comparison == ver_tuple(APP_VERSION):
+                state = "установлена"
+            elif comparison > ver_tuple(APP_VERSION):
+                state = "новее"
+            else:
+                state = "старее"
+            assets = []
+            if find_setup_asset(release):
+                assets.append("установщик")
+            if find_portable_asset(release):
+                assets.append("portable")
+            values = [version, release.get("published_at", "")[:10], state, ", ".join(assets) or "нет пакета"]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.UserRole, row)
+                self.table.setItem(row, column, item)
+
+        self.statusLabel.setText(
+            f"Установлена версия {APP_VERSION}. Доступно версий: {len(self._releases)}."
+        )
+        if self._releases:
+            self.table.selectRow(0)
+
+    def _selected_release(self) -> Optional[dict]:
+        row = self.table.currentRow()
+        if 0 <= row < len(self._releases):
+            return self._releases[row]
+        return None
+
+    def _selection_changed(self):
+        release = self._selected_release()
+        enabled = release is not None
+        self.openReleaseBtn.setEnabled(enabled and bool(release.get("html_url")))
+        has_package = enabled and bool(find_setup_asset(release) or find_portable_asset(release))
+        self.installBtn.setEnabled(has_package)
+        if release:
+            tag = release.get("tag_name", "")
+            self.installBtn.setText(
+                "Переустановить" if ver_tuple(tag) == ver_tuple(APP_VERSION)
+                else "Перейти на выбранную версию"
+            )
+            self.notes.setPlainText(release.get("body") or "Описание релиза отсутствует.")
+
+    def _open_release(self):
+        release = self._selected_release()
+        if release and release.get("html_url"):
+            QDesktopServices.openUrl(QUrl(release["html_url"]))
+
+    def _request_install(self):
+        release = self._selected_release()
+        if release:
+            self.install_requested.emit(release)
 
 
 # ---------------- Main selector window ----------------
@@ -666,7 +866,7 @@ class MainWindow(QMainWindow):
         uic.loadUi(str(uic_path), self)
 
         self.setWindowOpacity(0.93)
-        self._rollback_popup: Optional[RollbackPopup] = None
+        self._version_dialog: Optional[VersionManagerDialog] = None
         icon_path = get_resource_path("icon_cat.ico")
         try:
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -681,15 +881,15 @@ class MainWindow(QMainWindow):
 
         self.rollback_btn = QPushButton("↩", self)
         self.rollback_btn.setObjectName("smallUpdateBtn")
-        self.rollback_btn.setToolTip("Откат на предыдущую версию")
+        self.rollback_btn.setToolTip("Открыть список версий")
         self.rollback_btn.setFixedSize(26, 22)
-        self.rollback_btn.clicked.connect(self._show_rollback_versions)
+        self.rollback_btn.clicked.connect(self._open_version_manager)
 
         self.update_btn = QPushButton("↻", self)
         self.update_btn.setObjectName("smallUpdateBtn")
-        self.update_btn.setToolTip("Проверить обновления")
+        self.update_btn.setToolTip("Версии и обновления")
         self.update_btn.setFixedSize(26, 22)
-        self.update_btn.clicked.connect(lambda: self._check_for_updates(silent=False))
+        self.update_btn.clicked.connect(self._open_version_manager)
 
         try:
             hl = self.headerFrame.layout()
@@ -760,59 +960,55 @@ class MainWindow(QMainWindow):
         self._lab_windows.append(lab)
         lab.show()
 
-    def _show_rollback_versions(self):
-        if self._rollback_popup and self._rollback_popup.isVisible():
-            self._rollback_popup.close()
-            self._rollback_popup = None
+    def _open_version_manager(self):
+        if self._version_dialog and self._version_dialog.isVisible():
+            self._version_dialog.raise_()
+            self._version_dialog.activateWindow()
             return
+
+        dialog = VersionManagerDialog(self)
+        dialog.install_requested.connect(self._install_release)
+        dialog.finished.connect(lambda _=None: setattr(self, "_version_dialog", None))
+        self._version_dialog = dialog
+        dialog.show_loading()
+        dialog.show()
 
         def worker():
             try:
-                api = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
+                api = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=100"
                 releases = json.loads(github_request(api, timeout=20).decode("utf-8"))
-
-                current = ver_tuple(APP_VERSION)
-                candidates = []
-                for rel in releases:
-                    tag = rel.get("tag_name", "")
-                    if not tag or ver_tuple(tag) >= current:
-                        continue
-                    url = find_portable_asset_url(rel)
-                    if url:
-                        candidates.append((tag, url))
-
-                if not candidates:
-                    self._on_ui(lambda: QMessageBox.information(
-                        self, "Откат версии",
-                        "Нет доступных предыдущих версий с portable-архивом на GitHub."
-                    ))
-                    return
-
-                candidates.sort(key=lambda c: ver_tuple(c[0]), reverse=True)
-
-                def show_popup(cands=candidates):
-                    self._rollback_popup = RollbackPopup(self, cands, self.rollback_btn)
-                    self._rollback_popup.version_chosen.connect(self._do_rollback)
-                    self._rollback_popup.show()
-
-                self._on_ui(show_popup)
-            except Exception as e:
-                self._on_ui(lambda: QMessageBox.warning(
-                    self, "Ошибка отката", f"Не удалось получить список версий:\n{e}"
-                ))
+                if not isinstance(releases, list):
+                    raise ValueError("GitHub вернул неожиданный ответ")
+                self._on_ui(lambda data=releases: dialog.set_releases(data))
+            except Exception as error:
+                self._on_ui(lambda e=error: dialog.show_error(str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _do_rollback(self, asset_url: str, tag: str):
-        self._rollback_popup = None
+    def _install_release(self, release: dict):
+        tag = release.get("tag_name", "неизвестная версия")
+        mode = get_release_install_mode()
+        asset = find_setup_asset(release) if mode == "installer" else find_portable_asset(release)
+        if asset is None:
+            asset = find_portable_asset(release) or find_setup_asset(release)
+        if asset is None:
+            QMessageBox.warning(self, "Версии", f"Для {tag} нет установочного пакета.")
+            return
+
+        relation = "переустановить"
+        if ver_tuple(tag) > ver_tuple(APP_VERSION):
+            relation = "обновиться до"
+        elif ver_tuple(tag) < ver_tuple(APP_VERSION):
+            relation = "откатиться на"
+        package = "установщик" if asset.get("name", "").lower().endswith(".exe") else "portable-пакет"
         if QMessageBox.question(
-            self, "Подтверждение отката",
-            f"Откатиться на {tag}?\n\n"
-            "Файлы приложения будут заменены на версию из архива.\n"
-            "Приложение автоматически перезапустится."
+            self, "Смена версии",
+            f"{relation.capitalize()} {tag}?\n\n"
+            f"Будет загружен {package}. Несохранённые данные в других окнах приложения "
+            "следует сохранить перед продолжением."
         ) != QMessageBox.Yes:
             return
-        self._perform_self_update(asset_url, tag)
+        self._perform_release_install(asset, tag)
 
     def _check_for_updates(self, silent: bool = False):
         def worker():
@@ -836,12 +1032,10 @@ class MainWindow(QMainWindow):
                     return
 
                 latest_tag = data.get("tag_name", "v0.0.0")
-                asset_url = find_portable_asset_url(data)
-
-                if not asset_url:
+                if not (find_setup_asset(data) or find_portable_asset(data)):
                     if not silent:
                         self._on_ui(lambda: QMessageBox.information(
-                            self, "Обновления", "В релизе не найден portable zip."
+                            self, "Обновления", "В релизе не найден установочный пакет."
                         ))
                     return
 
@@ -855,13 +1049,20 @@ class MainWindow(QMainWindow):
                         ))
                     return
 
-                def ask_update(url=asset_url, tag=latest_tag):
+                def ask_update(release=data, tag=latest_tag):
                     if QMessageBox.question(
                         self, "Доступно обновление",
                         f"Доступна новая версия {tag} (у вас {APP_VERSION}).\n\n"
                         "Загрузить и установить сейчас?"
                     ) == QMessageBox.Yes:
-                        self._perform_self_update(url, tag)
+                        mode = get_release_install_mode()
+                        asset = (
+                            find_setup_asset(release) if mode == "installer"
+                            else find_portable_asset(release)
+                        )
+                        asset = asset or find_setup_asset(release) or find_portable_asset(release)
+                        if asset:
+                            self._perform_release_install(asset, tag)
 
                 self._on_ui(ask_update)
 
@@ -873,34 +1074,48 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _perform_self_update(self, download_url: str, new_tag: str):
+    def _perform_release_install(self, asset: dict, new_tag: str):
         progress = QMessageBox(self)
-        progress.setWindowTitle("Обновление")
+        progress.setWindowTitle("Смена версии")
         progress.setText(f"Загрузка {new_tag}...")
         progress.setStandardButtons(QMessageBox.NoButton)
         progress.show()
         QApplication.processEvents()
 
         def worker():
-            tmp_zip = None
+            tmp_file = None
             extract_dir = None
             try:
-                tmp_zip = os.path.join(tempfile.gettempdir(), f"xray_upd_{new_tag}.zip")
-                download_release_asset(download_url, tmp_zip)
+                suffix = ".exe" if asset.get("name", "").lower().endswith(".exe") else ".zip"
+                safe_tag = "".join(ch for ch in new_tag if ch.isalnum() or ch in ".-_")
+                tmp_file = os.path.join(tempfile.gettempdir(), f"xray_{safe_tag}{suffix}")
+                download_release_asset(asset, tmp_file)
+
+                if suffix == ".exe":
+                    self._on_ui(progress.close)
+                    self._on_ui(lambda p=tmp_file: self._launch_installer(p))
+                    return
 
                 extract_dir = tempfile.mkdtemp(prefix="xray_upd_")
-                with zipfile.ZipFile(tmp_zip, "r") as z:
-                    z.extractall(extract_dir)
+                safe_extract_zip(tmp_file, extract_dir)
 
                 src_dir = find_extracted_app_dir(extract_dir)
                 app_dir = get_app_install_dir()
                 exe_path = os.path.join(app_dir, "Xray_labs.exe")
+                if not os.path.isfile(os.path.join(src_dir, "Xray_labs.exe")):
+                    raise ValueError("В архиве не найден Xray_labs.exe")
+                if not os.path.isdir(app_dir) or not os.access(app_dir, os.W_OK):
+                    raise PermissionError(
+                        "Нет прав на запись в папку приложения. Используйте установщик из релиза."
+                    )
 
                 bat = os.path.join(tempfile.gettempdir(), "xray_updater.bat")
+                backup_dir = tempfile.mkdtemp(prefix="xray_backup_")
                 src_q = src_dir.replace('"', '""')
                 app_q = app_dir.replace('"', '""')
                 ext_q = extract_dir.replace('"', '""')
-                zip_q = tmp_zip.replace('"', '""')
+                zip_q = tmp_file.replace('"', '""')
+                backup_q = backup_dir.replace('"', '""')
                 bat_content = f"""@echo off
 chcp 65001 >nul
 setlocal
@@ -908,6 +1123,7 @@ set "SRC={src_q}"
 set "DEST={app_q}"
 set "EXE={exe_path}"
 set "EXTRACT={ext_q}"
+set "BACKUP={backup_q}"
 echo Ozhidanie zakrytiya Xray_labs...
 :waitloop
 tasklist /FI "IMAGENAME eq Xray_labs.exe" 2>nul | find /I "Xray_labs.exe" >nul
@@ -915,15 +1131,22 @@ if not errorlevel 1 (
     timeout /t 1 /nobreak >nul
     goto waitloop
 )
+robocopy "%DEST%" "%BACKUP%" /E /R:2 /W:1 /NFL /NDL /NJH /NJS >nul
 echo Kopirovanie obnovleniya...
 robocopy "%SRC%" "%DEST%" /E /R:8 /W:2 /NFL /NDL /NJH /NJS
 if errorlevel 8 (
-    echo Oshibka robocopy: %errorlevel%
-    pause
+    echo Update copy error: %errorlevel% > "%TEMP%\\Xray_labs_update_error.txt"
+    robocopy "%BACKUP%" "%DEST%" /E /R:4 /W:1 /NFL /NDL /NJH /NJS >nul
+    start "" "%EXE%"
+    rd /s /q "%EXTRACT%" >nul 2>&1
+    rd /s /q "%BACKUP%" >nul 2>&1
+    del /f /q "{zip_q}" >nul 2>&1
+    del "%~f0" >nul 2>&1
     exit /b 1
 )
 start "" "%EXE%"
 rd /s /q "%EXTRACT%" >nul 2>&1
+rd /s /q "%BACKUP%" >nul 2>&1
 del /f /q "{zip_q}" >nul 2>&1
 del "%~f0" >nul 2>&1
 """
@@ -937,13 +1160,27 @@ del "%~f0" >nul 2>&1
                 self._on_ui(lambda e=ex: QMessageBox.critical(
                     self, "Ошибка обновления", f"Не удалось загрузить или подготовить обновление:\n{e}"
                 ))
-                if tmp_zip and os.path.isfile(tmp_zip):
+                if tmp_file and os.path.isfile(tmp_file):
                     try:
-                        os.remove(tmp_zip)
+                        os.remove(tmp_file)
                     except OSError:
                         pass
+                if extract_dir and os.path.isdir(extract_dir):
+                    shutil.rmtree(extract_dir, ignore_errors=True)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _launch_installer(self, installer_path: str):
+        batch_path = os.path.join(tempfile.gettempdir(), "xray_installer_launcher.bat")
+        quoted = installer_path.replace('"', '""')
+        batch_content = f'''@echo off
+start /wait "" "{quoted}" /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS
+del /f /q "{quoted}" >nul 2>&1
+del "%~f0" >nul 2>&1
+'''
+        with open(batch_path, "w", encoding="cp866") as batch:
+            batch.write(batch_content)
+        self._launch_updater(batch_path)
 
     def _launch_updater(self, bat_path: str):
         CREATE_NO_WINDOW = 0x08000000

@@ -1,5 +1,5 @@
 """
-Constants and theme colors taken 1:1 from MolPlayer (C:\projects\MolPlayer\constants.py).
+Constants and theme colors taken 1:1 from MolPlayer (C:/projects/MolPlayer/constants.py).
 Industrial / molecular transformer dark blue + cyan glowing theme.
 Used for X-Ray-lab to match the requested color palette exactly.
 Semi-transparent window, Comic Sans preferred, etc.
@@ -52,7 +52,7 @@ ACCENT_CYAN = ACCENT_GLOW
 # App info
 APP_NAME = "Xray_labs"
 APP_DISPLAY_NAME = "X-Ray-lab"
-APP_VERSION = "0.0.3"
+APP_VERSION = "0.0.4"
 VERSION = APP_VERSION
 
 # For self-updater (must match GitHub repo)
