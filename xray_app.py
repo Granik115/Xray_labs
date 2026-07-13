@@ -1,5 +1,5 @@
 """
-X-Ray-lab v0.0.6
+X-Ray-lab v0.0.7
 PyQt5 + editable .ui files (open in Qt Designer).
 Color scheme from MolPlayer/constants.py (Laby.docx palette).
 """
@@ -446,6 +446,29 @@ def find_extracted_app_dir(extract_dir: str) -> str:
         if "Xray_labs.exe" in files:
             return root
     return extract_dir
+
+
+def build_silent_installer_batch(installer_path: str, app_executable: str) -> str:
+    """Build a fully unattended Inno Setup update launcher."""
+    installer_q = installer_path.replace('"', '""')
+    executable_q = app_executable.replace('"', '""')
+    return fr'''@echo off
+setlocal
+set "INSTALLER={installer_q}"
+set "APP_EXE={executable_q}"
+start "" /wait "%INSTALLER%" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /SP- /LOG="%TEMP%\Xray_labs_update.log"
+set "RESULT=%ERRORLEVEL%"
+if not "%RESULT%"=="0" (
+    echo Installer exit code: %RESULT% > "%TEMP%\Xray_labs_update_error.txt"
+    start "" "%APP_EXE%"
+    del /f /q "%INSTALLER%" >nul 2>&1
+    del "%~f0" >nul 2>&1
+    exit /b %RESULT%
+)
+start "" "%APP_EXE%"
+del /f /q "%INSTALLER%" >nul 2>&1
+del "%~f0" >nul 2>&1
+'''
 
 
 def calc_inclusion_volume_mm3(component_areas_mm2: List[float], incl_type: str) -> float:
@@ -1270,12 +1293,12 @@ del "%~f0" >nul 2>&1
 
     def _launch_installer(self, installer_path: str):
         batch_path = os.path.join(tempfile.gettempdir(), "xray_installer_launcher.bat")
-        quoted = installer_path.replace('"', '""')
-        batch_content = f'''@echo off
-start /wait "" "{quoted}" /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS
-del /f /q "{quoted}" >nul 2>&1
-del "%~f0" >nul 2>&1
-'''
+        app_executable = (
+            os.path.abspath(sys.executable)
+            if getattr(sys, "frozen", False)
+            else os.path.join(get_app_install_dir(), "Xray_labs.exe")
+        )
+        batch_content = build_silent_installer_batch(installer_path, app_executable)
         with open(batch_path, "w", encoding="cp866") as batch:
             batch.write(batch_content)
         self._launch_updater(batch_path)

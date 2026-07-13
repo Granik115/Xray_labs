@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import QApplication, QPushButton
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from xray_app import (
+    build_silent_installer_batch,
     calc_inclusion_volume_mm3,
     connected_component_areas,
     process_inclusions,
@@ -29,8 +30,25 @@ class CoreLogicTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def test_version_comparison(self):
-        self.assertGreater(ver_tuple("v0.0.6"), ver_tuple("0.0.5"))
-        self.assertEqual(APP_VERSION, "0.0.6")
+        self.assertGreater(ver_tuple("v0.0.7"), ver_tuple("0.0.6"))
+        self.assertEqual(APP_VERSION, "0.0.7")
+
+    def test_installer_update_is_fully_unattended_and_restarts_app(self):
+        script = build_silent_installer_batch(
+            r"C:\Temp\Xray_labs-0.0.7-setup.exe",
+            r"C:\Apps\X-Ray-lab\Xray_labs.exe",
+        )
+        for switch in (
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CLOSEAPPLICATIONS",
+            "/RESTARTAPPLICATIONS",
+            "/SP-",
+        ):
+            self.assertIn(switch, script)
+        self.assertIn('start "" "%APP_EXE%"', script)
+        self.assertIn("Installer exit code", script)
 
     def test_windows_are_opaque_and_version_button_is_not_duplicated(self):
         main = MainWindow()
