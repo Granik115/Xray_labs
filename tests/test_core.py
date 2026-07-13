@@ -1,12 +1,15 @@
 import os
+import hashlib
 import tempfile
+import time
 import unittest
 import zipfile
 import math
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
-from PyQt5.QtWidgets import QApplication, QPushButton
+from PyQt5.QtWidgets import QApplication, QMessageBox, QPushButton
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -15,6 +18,8 @@ from xray_app import (
     calc_inclusion_volume_mm3,
     connected_component_areas,
     detect_dark_inclusion_regions,
+    dismiss_update_progress,
+    download_release_asset,
     process_inclusions,
     safe_extract_zip,
     square_corners_from_diagonal,
@@ -31,8 +36,103 @@ class CoreLogicTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def test_version_comparison(self):
-        self.assertGreater(ver_tuple("v0.0.9"), ver_tuple("0.0.8"))
-        self.assertEqual(APP_VERSION, "0.0.9")
+        self.assertGreater(ver_tuple("v0.0.10"), ver_tuple("0.0.9"))
+        self.assertEqual(APP_VERSION, "0.0.10")
+
+    def test_release_download_resumes_after_connection_reset(self):
+        payload = b"first-half-second-half"
+
+        class ResetResponse:
+            status = 200
+            headers = {"Content-Length": str(len(payload))}
+
+            def __init__(self):
+                self.calls = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _size):
+                self.calls += 1
+                if self.calls == 1:
+                    return payload[:10]
+                raise ConnectionResetError(10054, "connection reset")
+
+        class ResumeResponse:
+            status = 206
+            headers = {"Content-Length": str(len(payload) - 10)}
+
+            def __init__(self):
+                self.remaining = payload[10:]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _size):
+                result, self.remaining = self.remaining, b""
+                return result
+
+        asset = {
+            "browser_download_url": "https://example.invalid/setup.exe",
+            "size": len(payload),
+            "digest": f"sha256:{hashlib.sha256(payload).hexdigest()}",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            destination = str(Path(temp) / "setup.exe")
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=[ResetResponse(), ResumeResponse()],
+            ) as urlopen:
+                download_release_asset(
+                    asset,
+                    destination,
+                    attempts=2,
+                    retry_delays=(),
+                )
+            self.assertEqual(Path(destination).read_bytes(), payload)
+            self.assertFalse(Path(f"{destination}.part").exists())
+            resume_request = urlopen.call_args_list[1].args[0]
+            self.assertEqual(resume_request.get_header("Range"), "bytes=10-")
+
+    def test_update_progress_can_always_be_dismissed(self):
+        progress = QMessageBox()
+        progress.setText("Загрузка...")
+        progress.setStandardButtons(QMessageBox.NoButton)
+        progress.show()
+        self.app.processEvents()
+        self.assertTrue(progress.isVisible())
+        dismiss_update_progress(progress)
+        self.assertFalse(progress.isVisible())
+
+    def test_download_error_clears_blocking_progress_dialog(self):
+        main = MainWindow()
+        main.show()
+        asset = {
+            "name": "Xray_labs-0.0.10-setup.exe",
+            "browser_download_url": "https://example.invalid/setup.exe",
+        }
+        try:
+            with patch(
+                "xray_app.download_release_asset",
+                side_effect=ConnectionError("WinError 10054"),
+            ), patch.object(QMessageBox, "critical", return_value=QMessageBox.Ok) as critical:
+                main._perform_release_install(asset, "v0.0.10")
+                deadline = time.monotonic() + 2.0
+                while main._update_progress is not None and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.01)
+                self.app.processEvents()
+                self.assertIsNone(main._update_progress)
+                self.assertIsNone(main._update_cancel_event)
+                critical.assert_called_once()
+        finally:
+            main.close()
 
     def test_installer_update_is_fully_unattended_and_restarts_app(self):
         script = build_silent_installer_batch(

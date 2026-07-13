@@ -1,5 +1,5 @@
 """
-X-Ray-lab v0.0.9
+X-Ray-lab v0.0.10
 PyQt5 + editable .ui files (open in Qt Designer).
 Color scheme from MolPlayer/constants.py (Laby.docx palette).
 """
@@ -9,7 +9,9 @@ import os
 import json
 import math
 import hashlib
+import http.client
 import tempfile
+import time
 import urllib.request
 import urllib.error
 import zipfile
@@ -19,7 +21,7 @@ import threading
 from collections import deque
 from pathlib import Path
 from statistics import median
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from PIL import Image, ImageChops, ImageFilter
 
@@ -381,28 +383,153 @@ def github_request(url: str, timeout: int = 30) -> bytes:
         return resp.read()
 
 
-def download_release_asset(asset: dict, dest_path: str):
+class DownloadCancelled(Exception):
+    """Raised when the user cancels an in-progress release download."""
+
+
+def _verify_release_asset(asset: dict, file_path: str):
+    digest = asset.get("digest", "")
+    if not digest.startswith("sha256:"):
+        return
+    expected = digest.split(":", 1)[1].lower()
+    sha256 = hashlib.sha256()
+    with open(file_path, "rb") as downloaded:
+        for chunk in iter(lambda: downloaded.read(1024 * 1024), b""):
+            sha256.update(chunk)
+    if sha256.hexdigest().lower() != expected:
+        os.remove(file_path)
+        raise ValueError("Контрольная сумма скачанного файла не совпала")
+
+
+def download_release_asset(
+    asset: dict,
+    dest_path: str,
+    attempts: int = 4,
+    retry_delays: Tuple[float, ...] = (1.0, 2.0, 4.0),
+    progress_callback: Optional[Callable[[int, int, int, int], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+):
+    """Download a GitHub asset with retries, resume support and SHA-256 checking."""
     url = asset.get("browser_download_url")
     if not url:
         raise ValueError("У файла релиза отсутствует ссылка для скачивания")
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": f"{APP_NAME}-Updater/{APP_VERSION}"},
-    )
-    with urllib.request.urlopen(req, timeout=180) as resp:
-        with open(dest_path, "wb") as out:
-            shutil.copyfileobj(resp, out)
+    attempts = max(1, attempts)
+    partial_path = f"{dest_path}.part"
+    try:
+        expected_size = max(0, int(asset.get("size") or 0))
+    except (TypeError, ValueError):
+        expected_size = 0
 
-    digest = asset.get("digest", "")
-    if digest.startswith("sha256:"):
-        expected = digest.split(":", 1)[1].lower()
-        sha256 = hashlib.sha256()
-        with open(dest_path, "rb") as downloaded:
-            for chunk in iter(lambda: downloaded.read(1024 * 1024), b""):
-                sha256.update(chunk)
-        if sha256.hexdigest().lower() != expected:
-            os.remove(dest_path)
-            raise ValueError("Контрольная сумма скачанного файла не совпала")
+    def report(downloaded: int, total: int, attempt: int):
+        if progress_callback:
+            try:
+                progress_callback(downloaded, total, attempt, attempts)
+            except Exception:
+                pass
+
+    def check_cancelled():
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled("Загрузка отменена пользователем")
+
+    if os.path.isfile(dest_path):
+        os.remove(dest_path)
+    if expected_size and os.path.isfile(partial_path):
+        partial_size = os.path.getsize(partial_path)
+        if partial_size > expected_size:
+            os.remove(partial_path)
+
+    transient_errors = (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        OSError,
+        TimeoutError,
+    )
+    last_error: Optional[BaseException] = None
+
+    for attempt in range(1, attempts + 1):
+        check_cancelled()
+        downloaded = os.path.getsize(partial_path) if os.path.isfile(partial_path) else 0
+        if expected_size and downloaded == expected_size:
+            os.replace(partial_path, dest_path)
+            _verify_release_asset(asset, dest_path)
+            report(expected_size, expected_size, attempt)
+            return
+
+        headers = {"User-Agent": f"{APP_NAME}-Updater/{APP_VERSION}"}
+        if downloaded:
+            headers["Range"] = f"bytes={downloaded}-"
+        request = urllib.request.Request(url, headers=headers)
+        report(downloaded, expected_size, attempt)
+
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                status = getattr(response, "status", None) or response.getcode()
+                append = downloaded > 0 and status == 206
+                if not append:
+                    downloaded = 0
+                content_length = int(response.headers.get("Content-Length") or 0)
+                total = expected_size or content_length + (downloaded if append else 0)
+                with open(partial_path, "ab" if append else "wb") as output:
+                    while True:
+                        check_cancelled()
+                        chunk = response.read(256 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        downloaded += len(chunk)
+                        report(downloaded, total, attempt)
+
+            actual_size = os.path.getsize(partial_path)
+            if expected_size and actual_size != expected_size:
+                raise OSError(
+                    f"получен неполный файл: {actual_size} из {expected_size} байт"
+                )
+            os.replace(partial_path, dest_path)
+            _verify_release_asset(asset, dest_path)
+            report(actual_size, expected_size or actual_size, attempt)
+            return
+        except DownloadCancelled:
+            for path in (partial_path, dest_path):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+            raise
+        except transient_errors as error:
+            last_error = error
+            if attempt >= attempts:
+                break
+            delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)] if retry_delays else 0
+            if cancel_event is not None:
+                if cancel_event.wait(delay):
+                    for path in (partial_path, dest_path):
+                        try:
+                            os.remove(path)
+                        except FileNotFoundError:
+                            pass
+                    raise DownloadCancelled("Загрузка отменена пользователем")
+            elif delay:
+                time.sleep(delay)
+
+    for path in (partial_path, dest_path):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    raise ConnectionError(
+        f"соединение прервалось после {attempts} попыток: {last_error}"
+    ) from last_error
+
+
+def dismiss_update_progress(progress: QMessageBox):
+    """Always remove a progress dialog, even during application shutdown."""
+    try:
+        progress.hide()
+        progress.done(QMessageBox.Rejected)
+        progress.deleteLater()
+    except RuntimeError:
+        # The parent window may already have destroyed the native Qt object.
+        pass
 
 
 def safe_extract_zip(zip_path: str, dest_dir: str):
@@ -1025,6 +1152,8 @@ class MainWindow(QMainWindow):
         uic.loadUi(str(uic_path), self)
 
         self._version_dialog: Optional[VersionManagerDialog] = None
+        self._update_progress: Optional[QMessageBox] = None
+        self._update_cancel_event: Optional[threading.Event] = None
         icon_path = get_resource_path("icon_cat.ico")
         try:
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -1057,6 +1186,15 @@ class MainWindow(QMainWindow):
     def focusInEvent(self, event):
         super().focusInEvent(event)
         self.raise_()
+
+    def closeEvent(self, event):
+        if self._update_cancel_event is not None:
+            self._update_cancel_event.set()
+            self._update_cancel_event = None
+        if self._update_progress is not None:
+            dismiss_update_progress(self._update_progress)
+            self._update_progress = None
+        super().closeEvent(event)
 
     def _populate_lab_buttons(self):
         container = self.labsContainer
@@ -1225,12 +1363,52 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _perform_release_install(self, asset: dict, new_tag: str):
+        if self._update_progress is not None:
+            self._update_progress.show()
+            self._update_progress.raise_()
+            return
+
         progress = QMessageBox(self)
         progress.setWindowTitle("Смена версии")
         progress.setText(f"Загрузка {new_tag}...")
-        progress.setStandardButtons(QMessageBox.NoButton)
+        progress.setStandardButtons(QMessageBox.Cancel)
+        progress.button(QMessageBox.Cancel).setText("Отмена")
+        progress.setWindowModality(Qt.WindowModal)
+        cancel_event = threading.Event()
+        progress.rejected.connect(cancel_event.set)
+        self._update_progress = progress
+        self._update_cancel_event = cancel_event
         progress.show()
         QApplication.processEvents()
+
+        def finish_progress():
+            if self._update_progress is progress:
+                self._update_progress = None
+                self._update_cancel_event = None
+            dismiss_update_progress(progress)
+
+        last_progress = {"attempt": 0, "percent": -1}
+
+        def report_progress(downloaded: int, total: int, attempt: int, max_attempts: int):
+            percent = round(downloaded * 100 / total) if total else -1
+            if attempt == last_progress["attempt"] and percent == last_progress["percent"]:
+                return
+            last_progress["attempt"] = attempt
+            last_progress["percent"] = percent
+            if total:
+                text = (
+                    f"Загрузка {new_tag}: {percent}%\n"
+                    f"Попытка {attempt} из {max_attempts}"
+                )
+            else:
+                text = (
+                    f"Загрузка {new_tag}: {downloaded / (1024 * 1024):.1f} МБ\n"
+                    f"Попытка {attempt} из {max_attempts}"
+                )
+            self._on_ui(
+                lambda value=text: progress.setText(value)
+                if self._update_progress is progress else None
+            )
 
         def worker():
             tmp_file = None
@@ -1239,11 +1417,19 @@ class MainWindow(QMainWindow):
                 suffix = ".exe" if asset.get("name", "").lower().endswith(".exe") else ".zip"
                 safe_tag = "".join(ch for ch in new_tag if ch.isalnum() or ch in ".-_")
                 tmp_file = os.path.join(tempfile.gettempdir(), f"xray_{safe_tag}{suffix}")
-                download_release_asset(asset, tmp_file)
+                download_release_asset(
+                    asset,
+                    tmp_file,
+                    progress_callback=report_progress,
+                    cancel_event=cancel_event,
+                )
+                if cancel_event.is_set():
+                    raise DownloadCancelled("Загрузка отменена пользователем")
 
                 if suffix == ".exe":
-                    self._on_ui(progress.close)
-                    self._on_ui(lambda p=tmp_file: self._launch_installer(p))
+                    self._on_ui(
+                        lambda p=tmp_file: (finish_progress(), self._launch_installer(p))
+                    )
                     return
 
                 extract_dir = tempfile.mkdtemp(prefix="xray_upd_")
@@ -1303,13 +1489,21 @@ del "%~f0" >nul 2>&1
                 with open(bat, "w", encoding="cp866") as f:
                     f.write(bat_content)
 
-                self._on_ui(progress.close)
-                self._on_ui(lambda b=bat: self._launch_updater(b))
+                self._on_ui(lambda b=bat: (finish_progress(), self._launch_updater(b)))
+            except DownloadCancelled:
+                self._on_ui(finish_progress)
             except Exception as ex:
-                self._on_ui(progress.close)
-                self._on_ui(lambda e=ex: QMessageBox.critical(
-                    self, "Ошибка обновления", f"Не удалось загрузить или подготовить обновление:\n{e}"
-                ))
+                def show_error(error=ex):
+                    finish_progress()
+                    if self.isVisible():
+                        QMessageBox.critical(
+                            self,
+                            "Ошибка обновления",
+                            "Не удалось загрузить или подготовить обновление:\n"
+                            f"{error}\n\nМожно повторить попытку или скачать установщик из релиза.",
+                        )
+
+                self._on_ui(show_error)
                 if tmp_file and os.path.isfile(tmp_file):
                     try:
                         os.remove(tmp_file)
