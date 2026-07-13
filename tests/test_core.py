@@ -6,7 +6,7 @@ import unittest
 import zipfile
 import math
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from PIL import Image
 from PyQt5.QtWidgets import QApplication, QMessageBox, QPushButton
@@ -101,18 +101,14 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(resume_request.get_header("Range"), "bytes=10-")
 
     def test_update_progress_can_always_be_dismissed(self):
-        progress = QMessageBox()
-        progress.setText("Загрузка...")
-        progress.setStandardButtons(QMessageBox.NoButton)
-        progress.show()
-        self.app.processEvents()
-        self.assertTrue(progress.isVisible())
+        progress = MagicMock()
         dismiss_update_progress(progress)
-        self.assertFalse(progress.isVisible())
+        progress.hide.assert_called_once_with()
+        progress.done.assert_called_once_with(QMessageBox.Rejected)
+        progress.deleteLater.assert_called_once_with()
 
     def test_download_error_clears_blocking_progress_dialog(self):
         main = MainWindow()
-        main.show()
         asset = {
             "name": "Xray_labs-0.0.10-setup.exe",
             "browser_download_url": "https://example.invalid/setup.exe",
@@ -121,6 +117,8 @@ class CoreLogicTests(unittest.TestCase):
             with patch(
                 "xray_app.download_release_asset",
                 side_effect=ConnectionError("WinError 10054"),
+            ), patch.object(QMessageBox, "show"), patch.object(
+                main, "isVisible", return_value=True
             ), patch.object(QMessageBox, "critical", return_value=QMessageBox.Ok) as critical:
                 main._perform_release_install(asset, "v0.0.10")
                 deadline = time.monotonic() + 2.0
