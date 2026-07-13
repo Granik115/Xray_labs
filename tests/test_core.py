@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 
 from PIL import Image
+from PyQt5.QtWidgets import QApplication, QPushButton
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -16,14 +17,37 @@ from xray_app import (
     safe_extract_zip,
     square_corners_from_diagonal,
     ver_tuple,
+    Lab1Window,
+    MainWindow,
 )
 from constants import APP_VERSION
 
 
 class CoreLogicTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
     def test_version_comparison(self):
-        self.assertGreater(ver_tuple("v0.0.5"), ver_tuple("0.0.4"))
-        self.assertEqual(APP_VERSION, "0.0.5")
+        self.assertGreater(ver_tuple("v0.0.6"), ver_tuple("0.0.5"))
+        self.assertEqual(APP_VERSION, "0.0.6")
+
+    def test_windows_are_opaque_and_version_button_is_not_duplicated(self):
+        main = MainWindow()
+        lab = Lab1Window(main_window=main)
+        try:
+            version_buttons = [
+                button
+                for button in main.findChildren(QPushButton)
+                if button.objectName() == "smallUpdateBtn"
+            ]
+            self.assertEqual(len(version_buttons), 1)
+            self.assertEqual(version_buttons[0].text(), "↻")
+            self.assertEqual(main.windowOpacity(), 1.0)
+            self.assertEqual(lab.windowOpacity(), 1.0)
+        finally:
+            lab.close()
+            main.close()
 
     def test_diagonal_defines_a_true_square(self):
         corners = square_corners_from_diagonal(0, 0, 100, 80)

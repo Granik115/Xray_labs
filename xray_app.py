@@ -1,5 +1,5 @@
 """
-X-Ray-lab v0.0.5
+X-Ray-lab v0.0.6
 PyQt5 + editable .ui files (open in Qt Designer).
 Color scheme from MolPlayer/constants.py (Laby.docx palette).
 """
@@ -474,7 +474,6 @@ class Lab1Window(QMainWindow):
         uic_path = get_resource_path("ui/lab1_window.ui")
         uic.loadUi(str(uic_path), self)
 
-        self.setWindowOpacity(0.93)
         self.setFixedSize(1000, 660)
         self.setWindowIcon(QIcon(str(get_resource_path("icon_cat.ico"))))
 
@@ -973,7 +972,6 @@ class MainWindow(QMainWindow):
         uic_path = get_resource_path("ui/main_window.ui")
         uic.loadUi(str(uic_path), self)
 
-        self.setWindowOpacity(0.93)
         self._version_dialog: Optional[VersionManagerDialog] = None
         icon_path = get_resource_path("icon_cat.ico")
         try:
@@ -987,12 +985,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_DISPLAY_NAME} v{APP_VERSION}")
         self.setFixedSize(800, 600)
 
-        self.rollback_btn = QPushButton("↩", self)
-        self.rollback_btn.setObjectName("smallUpdateBtn")
-        self.rollback_btn.setToolTip("Открыть список версий")
-        self.rollback_btn.setFixedSize(26, 22)
-        self.rollback_btn.clicked.connect(self._open_version_manager)
-
         self.update_btn = QPushButton("↻", self)
         self.update_btn.setObjectName("smallUpdateBtn")
         self.update_btn.setToolTip("Версии и обновления")
@@ -1002,11 +994,9 @@ class MainWindow(QMainWindow):
         try:
             hl = self.headerFrame.layout()
             if hl:
-                hl.addWidget(self.rollback_btn)
                 hl.addWidget(self.update_btn)
         except Exception:
             self.update_btn.move(self.width() - 40, 8)
-            self.rollback_btn.move(self.width() - 70, 8)
 
         self._lab_windows = []
         self._populate_lab_buttons()

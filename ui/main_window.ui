@@ -17,7 +17,7 @@
    </size>
   </property>
   <property name="windowTitle">
-   <string>X-Ray-lab v0.0.5</string>
+   <string>X-Ray-lab v0.0.6</string>
   </property>
   <widget class="QWidget" name="centralwidget">
    <layout class="QVBoxLayout" name="verticalLayout">
