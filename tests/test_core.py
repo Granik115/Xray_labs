@@ -30,8 +30,8 @@ class CoreLogicTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def test_version_comparison(self):
-        self.assertGreater(ver_tuple("v0.0.7"), ver_tuple("0.0.6"))
-        self.assertEqual(APP_VERSION, "0.0.7")
+        self.assertGreater(ver_tuple("v0.0.8"), ver_tuple("0.0.7"))
+        self.assertEqual(APP_VERSION, "0.0.8")
 
     def test_installer_update_is_fully_unattended_and_restarts_app(self):
         script = build_silent_installer_batch(
@@ -108,6 +108,36 @@ class CoreLogicTests(unittest.TestCase):
         self.assertLess(white_count, 30)
         self.assertEqual(sum(component_areas), white_count)
         self.assertEqual(overlay.getpixel((50, 50)), (0, 191, 255))
+
+    def test_half_depth_detection_is_dark_only_and_rejects_size_outlier(self):
+        width = height = 180
+        image = Image.new("L", (width, height))
+        pixels = image.load()
+        spots = [
+            (45, 45, 62, 2.1),
+            (90, 45, 58, 2.1),
+            (135, 45, 65, 2.1),
+            (90, 105, 22, 2.1),  # weak but correctly sized dark point
+            (45, 125, 70, 5.5),  # much too large
+        ]
+        for y in range(height):
+            for x in range(width):
+                value = 135 + x * 18 / width
+                for center_x, center_y, depth, sigma in spots:
+                    distance = (x - center_x) ** 2 + (y - center_y) ** 2
+                    value -= depth * math.exp(-distance / (2 * sigma ** 2))
+                # A bright defect must never be interpreted as a dark inclusion.
+                bright_distance = (x - 135) ** 2 + (y - 125) ** 2
+                value += 70 * math.exp(-bright_distance / (2 * 2.1 ** 2))
+                pixels[x, y] = max(0, min(255, round(value)))
+
+        _, overlay, _, component_areas = process_inclusions(
+            image, None, "square", contrast_threshold=8
+        )
+        self.assertEqual(len(component_areas), 4)
+        self.assertNotEqual(overlay.getpixel((45, 125)), (0, 191, 255))
+        self.assertNotEqual(overlay.getpixel((135, 125)), (0, 191, 255))
+        self.assertEqual(overlay.getpixel((90, 105)), (0, 191, 255))
 
     def test_safe_extract_rejects_path_traversal(self):
         with tempfile.TemporaryDirectory() as temp:

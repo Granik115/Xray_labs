@@ -1,5 +1,5 @@
 """
-X-Ray-lab v0.0.7
+X-Ray-lab v0.0.8
 PyQt5 + editable .ui files (open in Qt Designer).
 Color scheme from MolPlayer/constants.py (Laby.docx palette).
 """
@@ -18,6 +18,7 @@ import subprocess
 import threading
 from collections import deque
 from pathlib import Path
+from statistics import median
 from typing import List, Optional, Tuple
 
 from PIL import Image, ImageChops, ImageFilter
@@ -142,99 +143,139 @@ def connected_component_areas(mask: bytearray, width: int, height: int) -> List[
     return result
 
 
-def filter_inclusion_components(
-    mask: bytearray,
+def detect_dark_inclusion_regions(
+    grayscale: Image.Image,
     roi_mask: bytearray,
-    width: int,
-    height: int,
-    min_area: int = 2,
-    grayscale: Optional[Image.Image] = None,
-    min_surrounding_contrast: float = 8.0,
+    contrast_threshold: Optional[int] = None,
 ) -> Tuple[bytearray, List[int]]:
-    """Keep compact dark spots surrounded by brighter pixels in every direction."""
-    remaining = bytearray(mask)
-    filtered = bytearray(width * height)
-    areas: List[int] = []
-    gray_pixels = grayscale.load() if grayscale is not None else None
+    """Detect compact dark Gaussian-like valleys and keep their half-depth area."""
+    width, height = grayscale.size
+    scale = min(width, height)
+    spot_radius = max(3, min(8, round(scale / 115)))
+    background_radius = max(4, min(14, round(scale / 80)))
+    nms_radius = spot_radius
+    region_radius = max(7, spot_radius * 2 + 1)
+    minimum_peak = contrast_threshold if contrast_threshold is not None else max(8, round(spot_radius * 2.5))
+    strong_peak = max(24, minimum_peak * 3)
 
-    for start in range(width * height):
-        if not remaining[start]:
-            continue
-        remaining[start] = 0
-        queue = deque([start])
-        component: List[int] = []
-        touches_boundary = False
-        while queue:
-            index = queue.popleft()
-            component.append(index)
-            x = index % width
-            y = index // width
+    smooth = grayscale.filter(ImageFilter.GaussianBlur(max(0.7, spot_radius / 5)))
+    local_background = smooth.filter(ImageFilter.GaussianBlur(background_radius))
+    dark_response = ImageChops.subtract(local_background, smooth)
+    response_pixels = dark_response.load()
+    smooth_pixels = smooth.load()
 
-            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
-                if nx < 0 or ny < 0 or nx >= width or ny >= height:
-                    touches_boundary = True
-                elif not roi_mask[ny * width + nx]:
-                    touches_boundary = True
+    roi_image = Image.frombytes("L", (width, height), bytes(roi_mask))
+    boundary_margin = max(9, spot_radius * 3)
+    filter_size = boundary_margin * 2 + 1
+    interior_pixels = roi_image.filter(ImageFilter.MinFilter(filter_size)).load()
 
-            for ny in range(max(0, y - 1), min(height, y + 2)):
-                row = ny * width
-                for nx in range(max(0, x - 1), min(width, x + 2)):
-                    neighbor = row + nx
-                    if remaining[neighbor]:
-                        remaining[neighbor] = 0
-                        queue.append(neighbor)
-
-        surrounded = True
-        if gray_pixels is not None and component:
-            xs = [index % width for index in component]
-            ys = [index // width for index in component]
-            center_x = round(sum(xs) / len(xs))
-            center_y = round(sum(ys) / len(ys))
-            box_width = max(xs) - min(xs) + 1
-            box_height = max(ys) - min(ys) + 1
-            radius = max(5, max(box_width, box_height) + 2)
-            component_values = sorted(gray_pixels[index % width, index // width] for index in component)
-            dark_half = component_values[:max(1, len(component_values) // 2)]
-            center_value = sum(dark_half) / len(dark_half)
-            brighter_directions = 0
-            for dx, dy in (
-                (1, 0), (-1, 0), (0, 1), (0, -1),
-                (1, 1), (1, -1), (-1, 1), (-1, -1),
+    preliminary: List[Tuple[int, int, int]] = []
+    for y in range(nms_radius, height - nms_radius):
+        for x in range(nms_radius, width - nms_radius):
+            peak = response_pixels[x, y]
+            if peak < minimum_peak or not interior_pixels[x, y]:
+                continue
+            if any(
+                response_pixels[nx, ny] > peak
+                for ny in range(y - nms_radius, y + nms_radius + 1)
+                for nx in range(x - nms_radius, x + nms_radius + 1)
             ):
-                sample_x = center_x + dx * radius
-                sample_y = center_y + dy * radius
-                if not (0 <= sample_x < width and 0 <= sample_y < height):
+                continue
+            preliminary.append((peak, x, y))
+
+    preliminary.sort(reverse=True)
+    peaks: List[Tuple[int, int, int]] = []
+    for peak, x, y in preliminary:
+        if any(
+            (x - other_x) ** 2 + (y - other_y) ** 2 <= nms_radius ** 2
+            for _, other_x, other_y in peaks
+        ):
+            continue
+        peaks.append((peak, x, y))
+
+    candidates: List[dict] = []
+    for peak, seed_x, seed_y in peaks:
+        half_depth = max(4.0, peak / 2.0)
+        queue = deque([(seed_x, seed_y)])
+        seen = {(seed_x, seed_y)}
+        region: List[Tuple[int, int]] = []
+        while queue:
+            x, y = queue.popleft()
+            if response_pixels[x, y] < half_depth or not interior_pixels[x, y]:
+                continue
+            region.append((x, y))
+            for next_x, next_y in (
+                (x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)
+            ):
+                if (next_x, next_y) in seen:
                     continue
-                if not roi_mask[sample_y * width + sample_x]:
+                if abs(next_x - seed_x) > region_radius or abs(next_y - seed_y) > region_radius:
                     continue
-                patch = []
-                for py in range(max(0, sample_y - 1), min(height, sample_y + 2)):
-                    for px in range(max(0, sample_x - 1), min(width, sample_x + 2)):
-                        if roi_mask[py * width + px]:
-                            patch.append(gray_pixels[px, py])
-                if patch and sum(patch) / len(patch) - center_value >= min_surrounding_contrast:
-                    brighter_directions += 1
-            surrounded = brighter_directions >= 7
+                seen.add((next_x, next_y))
+                queue.append((next_x, next_y))
 
-        if len(component) >= min_area and not touches_boundary and surrounded:
-            areas.append(len(component))
-            for index in component:
-                filtered[index] = 1
+        if len(region) < 3:
+            continue
+        xs = [x for x, _ in region]
+        ys = [y for _, y in region]
+        box_width = max(xs) - min(xs) + 1
+        box_height = max(ys) - min(ys) + 1
+        compactness = len(region) / (box_width * box_height)
+        aspect_ratio = max(box_width, box_height) / min(box_width, box_height)
+        if compactness < 0.6 or aspect_ratio > 1.6:
+            continue
 
-    return filtered, areas
+        core_level = min(smooth_pixels[x, y] for x, y in region)
+        sample_radius = max(7, max(box_width, box_height) + 3)
+        minimum_surrounding_delta = max(5, minimum_peak * 0.5)
+        brighter_directions = 0
+        for dx, dy in (
+            (1, 0), (-1, 0), (0, 1), (0, -1),
+            (1, 1), (1, -1), (-1, 1), (-1, -1),
+        ):
+            sample_x = seed_x + dx * sample_radius
+            sample_y = seed_y + dy * sample_radius
+            if not (0 <= sample_x < width and 0 <= sample_y < height):
+                continue
+            if not interior_pixels[sample_x, sample_y]:
+                continue
+            if smooth_pixels[sample_x, sample_y] - core_level >= minimum_surrounding_delta:
+                brighter_directions += 1
+        if brighter_directions != 8:
+            continue
 
+        candidates.append({"peak": peak, "region": region, "area": len(region)})
 
-def histogram_percentile(histogram: List[int], percentile: float) -> int:
-    total = sum(histogram)
-    if total <= 0:
-        return 0
-    target = max(1, math.ceil(total * percentile))
-    cumulative = 0
-    for value, count in enumerate(histogram):
-        cumulative += count
-        if cumulative >= target:
-            return value
-    return len(histogram) - 1
+    if not candidates:
+        return bytearray(width * height), []
+
+    strong = [candidate for candidate in candidates if candidate["peak"] >= strong_peak]
+    reference = strong if len(strong) >= 3 else sorted(
+        candidates, key=lambda candidate: candidate["peak"], reverse=True
+    )[:min(10, len(candidates))]
+    typical_area = float(median(candidate["area"] for candidate in reference))
+
+    # Area bounds correspond to approximately 0.72x..1.28x of the typical diameter.
+    minimum_area = typical_area * (0.72 ** 2)
+    maximum_area = typical_area * (1.28 ** 2)
+    selected = [
+        candidate for candidate in candidates
+        if minimum_area <= candidate["area"] <= maximum_area
+    ]
+    selected.sort(key=lambda candidate: candidate["peak"], reverse=True)
+
+    mask = bytearray(width * height)
+    areas: List[int] = []
+    for candidate in selected:
+        unique_area = 0
+        for x, y in candidate["region"]:
+            index = y * width + x
+            if not mask[index]:
+                mask[index] = 1
+                unique_area += 1
+        if unique_area:
+            areas.append(unique_area)
+    return mask, areas
 
 
 def process_inclusions(
@@ -246,9 +287,8 @@ def process_inclusions(
     """
     Returns (original_rgb, processed_rgb, white_pixel_count_inside_mask,
     connected_component_areas_px).
-    Dark inclusions are detected relative to a blurred local background. This
-    suppresses broad exposure gradients and unevenly illuminated corners.
-    The returned processed image keeps the original and highlights findings.
+    Only dark local minima are considered. Each Gaussian-like valley is marked
+    from its center to half of its local depth, then size outliers are removed.
     """
     if original.mode != "L":
         gray = original.convert("L")
@@ -290,38 +330,15 @@ def process_inclusions(
             if in_roi:
                 roi_mask[y * w + x] = 255
 
-    spot_window = max(9, min(21, 2 * round(min(w, h) / 80) + 1))
-    local_background = gray.filter(ImageFilter.MaxFilter(spot_window)).filter(
-        ImageFilter.MinFilter(spot_window)
-    )
-    local_contrast = ImageChops.subtract(local_background, gray)
     roi_image = Image.frombytes("L", (w, h), bytes(roi_mask))
-    histogram = local_contrast.histogram(mask=roi_image)
-    median = histogram_percentile(histogram, 0.5)
-    deviation_histogram = [0] * 256
-    for value, count in enumerate(histogram):
-        deviation_histogram[abs(value - median)] += count
-    mad = histogram_percentile(deviation_histogram, 0.5)
-    threshold = contrast_threshold or max(18, round(median + 4.5 * 1.4826 * mad))
-
-    contrast_pixels = local_contrast.load()
-    raw_mask = bytearray(w * h)
-    binary_roi = bytearray(1 if value else 0 for value in roi_mask)
-    for y in range(h):
-        row = y * w
-        for x in range(w):
-            if binary_roi[row + x] and contrast_pixels[x, y] >= threshold:
-                raw_mask[row + x] = 1
-
-    inclusion_mask, component_areas = filter_inclusion_components(
-        raw_mask, binary_roi, w, h, grayscale=gray
+    inclusion_mask, component_areas = detect_dark_inclusion_regions(
+        gray, roi_mask, contrast_threshold=contrast_threshold
     )
     white_count = sum(component_areas)
 
-    # Enlarge only the visual marker; volume calculations use the original mask.
     marker = Image.frombytes(
         "L", (w, h), bytes(255 if value else 0 for value in inclusion_mask)
-    ).filter(ImageFilter.MaxFilter(5))
+    )
     marker = ImageChops.multiply(marker, roi_image)
     cyan = Image.new("RGB", (w, h), (0, 191, 255))
     processed = Image.composite(cyan, orig_rgb, marker)
