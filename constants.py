@@ -52,7 +52,7 @@ ACCENT_CYAN = ACCENT_GLOW
 # App info
 APP_NAME = "Xray_labs"
 APP_DISPLAY_NAME = "X-Ray-lab"
-APP_VERSION = "0.0.8"
+APP_VERSION = "0.0.9"
 VERSION = APP_VERSION
 
 # For self-updater (must match GitHub repo)

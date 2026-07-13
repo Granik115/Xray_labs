@@ -14,6 +14,7 @@ from xray_app import (
     build_silent_installer_batch,
     calc_inclusion_volume_mm3,
     connected_component_areas,
+    detect_dark_inclusion_regions,
     process_inclusions,
     safe_extract_zip,
     square_corners_from_diagonal,
@@ -30,8 +31,8 @@ class CoreLogicTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def test_version_comparison(self):
-        self.assertGreater(ver_tuple("v0.0.8"), ver_tuple("0.0.7"))
-        self.assertEqual(APP_VERSION, "0.0.8")
+        self.assertGreater(ver_tuple("v0.0.9"), ver_tuple("0.0.8"))
+        self.assertEqual(APP_VERSION, "0.0.9")
 
     def test_installer_update_is_fully_unattended_and_restarts_app(self):
         script = build_silent_installer_batch(
@@ -138,6 +139,34 @@ class CoreLogicTests(unittest.TestCase):
         self.assertNotEqual(overlay.getpixel((45, 125)), (0, 191, 255))
         self.assertNotEqual(overlay.getpixel((135, 125)), (0, 191, 255))
         self.assertEqual(overlay.getpixel((90, 105)), (0, 191, 255))
+
+    def test_near_boundary_particle_survives_but_smaller_noise_does_not(self):
+        width = height = 180
+        image = Image.new("L", (width, height))
+        pixels = image.load()
+        spots = [
+            (45, 45, 62, 2.1),
+            (90, 45, 60, 2.1),
+            (135, 45, 64, 2.1),
+            (90, 151, 58, 2.1),  # normal particle, 9 px from ROI border
+            (120, 105, 58, 1.25),  # undersized noise with similar peak
+        ]
+        for y in range(height):
+            for x in range(width):
+                value = 140
+                for center_x, center_y, depth, sigma in spots:
+                    distance = (x - center_x) ** 2 + (y - center_y) ** 2
+                    value -= depth * math.exp(-distance / (2 * sigma ** 2))
+                pixels[x, y] = max(0, min(255, round(value)))
+
+        roi_mask = bytearray(width * height)
+        for y in range(20, 161):
+            for x in range(20, 161):
+                roi_mask[y * width + x] = 255
+        mask, areas = detect_dark_inclusion_regions(image, roi_mask, contrast_threshold=8)
+        self.assertEqual(len(areas), 4)
+        self.assertTrue(mask[151 * width + 90])
+        self.assertFalse(mask[105 * width + 120])
 
     def test_safe_extract_rejects_path_traversal(self):
         with tempfile.TemporaryDirectory() as temp:

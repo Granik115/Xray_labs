@@ -1,5 +1,5 @@
 """
-X-Ray-lab v0.0.8
+X-Ray-lab v0.0.9
 PyQt5 + editable .ui files (open in Qt Designer).
 Color scheme from MolPlayer/constants.py (Laby.docx palette).
 """
@@ -165,15 +165,18 @@ def detect_dark_inclusion_regions(
     smooth_pixels = smooth.load()
 
     roi_image = Image.frombytes("L", (width, height), bytes(roi_mask))
-    boundary_margin = max(9, spot_radius * 3)
+    # The center may be close to a user-drawn ROI border, but the detected
+    # half-depth region itself must remain inside it.
+    boundary_margin = max(6, spot_radius * 2)
     filter_size = boundary_margin * 2 + 1
-    interior_pixels = roi_image.filter(ImageFilter.MinFilter(filter_size)).load()
+    center_pixels = roi_image.filter(ImageFilter.MinFilter(filter_size)).load()
+    roi_pixels = roi_image.load()
 
     preliminary: List[Tuple[int, int, int]] = []
     for y in range(nms_radius, height - nms_radius):
         for x in range(nms_radius, width - nms_radius):
             peak = response_pixels[x, y]
-            if peak < minimum_peak or not interior_pixels[x, y]:
+            if peak < minimum_peak or not center_pixels[x, y]:
                 continue
             if any(
                 response_pixels[nx, ny] > peak
@@ -199,11 +202,19 @@ def detect_dark_inclusion_regions(
         queue = deque([(seed_x, seed_y)])
         seen = {(seed_x, seed_y)}
         region: List[Tuple[int, int]] = []
+        touches_roi_boundary = False
         while queue:
             x, y = queue.popleft()
-            if response_pixels[x, y] < half_depth or not interior_pixels[x, y]:
+            if response_pixels[x, y] < half_depth or not roi_pixels[x, y]:
                 continue
             region.append((x, y))
+            for border_x, border_y in (
+                (x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)
+            ):
+                if not (0 <= border_x < width and 0 <= border_y < height):
+                    touches_roi_boundary = True
+                elif not roi_pixels[border_x, border_y]:
+                    touches_roi_boundary = True
             for next_x, next_y in (
                 (x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)
             ):
@@ -214,7 +225,7 @@ def detect_dark_inclusion_regions(
                 seen.add((next_x, next_y))
                 queue.append((next_x, next_y))
 
-        if len(region) < 3:
+        if len(region) < 3 or touches_roi_boundary:
             continue
         xs = [x for x, _ in region]
         ys = [y for _, y in region]
@@ -229,6 +240,7 @@ def detect_dark_inclusion_regions(
         sample_radius = max(7, max(box_width, box_height) + 3)
         minimum_surrounding_delta = max(5, minimum_peak * 0.5)
         brighter_directions = 0
+        fallen_directions = 0
         for dx, dy in (
             (1, 0), (-1, 0), (0, 1), (0, -1),
             (1, 1), (1, -1), (-1, 1), (-1, -1),
@@ -237,11 +249,11 @@ def detect_dark_inclusion_regions(
             sample_y = seed_y + dy * sample_radius
             if not (0 <= sample_x < width and 0 <= sample_y < height):
                 continue
-            if not interior_pixels[sample_x, sample_y]:
-                continue
             if smooth_pixels[sample_x, sample_y] - core_level >= minimum_surrounding_delta:
                 brighter_directions += 1
-        if brighter_directions != 8:
+            if response_pixels[sample_x, sample_y] <= peak * 0.55:
+                fallen_directions += 1
+        if brighter_directions != 8 or fallen_directions < 7:
             continue
 
         candidates.append({"peak": peak, "region": region, "area": len(region)})
@@ -255,8 +267,8 @@ def detect_dark_inclusion_regions(
     )[:min(10, len(candidates))]
     typical_area = float(median(candidate["area"] for candidate in reference))
 
-    # Area bounds correspond to approximately 0.72x..1.28x of the typical diameter.
-    minimum_area = typical_area * (0.72 ** 2)
+    # A 4..6 px particle around a typical 5 px diameter remains admissible.
+    minimum_area = typical_area * (0.80 ** 2)
     maximum_area = typical_area * (1.28 ** 2)
     selected = [
         candidate for candidate in candidates
