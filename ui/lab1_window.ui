@@ -128,7 +128,7 @@
             <string>мм</string>
            </property>
            <property name="maxLength">
-            <number>3</number>
+            <number>8</number>
            </property>
           </widget>
          </item>
@@ -145,7 +145,7 @@
             <string>мм</string>
            </property>
            <property name="maxLength">
-            <number>3</number>
+            <number>8</number>
            </property>
           </widget>
          </item>

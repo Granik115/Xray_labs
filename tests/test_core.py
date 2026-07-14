@@ -20,6 +20,7 @@ from xray_app import (
     detect_dark_inclusion_regions,
     dismiss_update_progress,
     download_release_asset,
+    parse_measurement_mm,
     process_inclusions,
     safe_extract_zip,
     square_corners_from_diagonal,
@@ -36,8 +37,20 @@ class CoreLogicTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def test_version_comparison(self):
-        self.assertGreater(ver_tuple("v0.0.10"), ver_tuple("0.0.9"))
-        self.assertEqual(APP_VERSION, "0.0.10")
+        self.assertGreater(ver_tuple("v0.0.11"), ver_tuple("0.0.10"))
+        self.assertEqual(APP_VERSION, "0.0.11")
+
+    def test_three_digit_and_decimal_measurements_are_accepted(self):
+        self.assertEqual(parse_measurement_mm("101"), 101.0)
+        self.assertEqual(parse_measurement_mm("100,5"), 100.5)
+        self.assertEqual(parse_measurement_mm("100.5"), 100.5)
+        self.assertEqual(parse_measurement_mm("10000"), 0.0)
+        lab = Lab1Window()
+        try:
+            self.assertGreaterEqual(lab.diamEdit.maxLength(), 8)
+            self.assertGreaterEqual(lab.thickEdit.maxLength(), 8)
+        finally:
+            lab.close()
 
     def test_release_download_resumes_after_connection_reset(self):
         payload = b"first-half-second-half"
@@ -189,6 +202,14 @@ class CoreLogicTests(unittest.TestCase):
         spherical = calc_inclusion_volume_mm3([4.0, 9.0], "sphere")
         self.assertAlmostEqual(spherical, 4.0 * 35.0 / (3.0 * 3.141592653589793 ** 0.5))
 
+    def test_ten_half_millimetre_spheres_are_below_one_cubic_mm(self):
+        diameter = 0.5
+        cross_section = math.pi * (diameter / 2.0) ** 2
+        actual = calc_inclusion_volume_mm3([cross_section] * 10, "sphere")
+        expected = 10 * math.pi * diameter ** 3 / 6.0
+        self.assertAlmostEqual(actual, expected)
+        self.assertLess(actual, 1.0)
+
     def test_local_contrast_ignores_smooth_exposure_gradient(self):
         width = height = 100
         image = Image.new("L", (width, height))
@@ -203,10 +224,17 @@ class CoreLogicTests(unittest.TestCase):
         _, overlay, white_count, component_areas = process_inclusions(
             image, ((0, 0), (99, 99)), "square", contrast_threshold=10
         )
-        self.assertGreaterEqual(white_count, 12)
+        self.assertGreater(white_count, 0)
         self.assertLess(white_count, 30)
         self.assertEqual(sum(component_areas), white_count)
         self.assertEqual(overlay.getpixel((50, 50)), (0, 191, 255))
+        raw_overlay = overlay.tobytes()
+        cyan = bytes((0, 191, 255))
+        cyan_pixels = sum(
+            raw_overlay[offset:offset + 3] == cyan
+            for offset in range(0, len(raw_overlay), 3)
+        )
+        self.assertGreater(cyan_pixels, white_count)
 
     def test_half_depth_detection_is_dark_only_and_rejects_size_outlier(self):
         width = height = 180

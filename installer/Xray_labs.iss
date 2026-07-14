@@ -4,7 +4,7 @@
 
 #define MyAppName "X-Ray-lab"
 #ifndef MyAppVersion
-#define MyAppVersion "0.0.10"
+#define MyAppVersion "0.0.11"
 #endif
 #define MyAppPublisher "Granik115"
 #define MyAppURL "https://github.com/Granik115/Xray_labs"

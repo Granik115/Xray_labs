@@ -1,5 +1,5 @@
 """
-X-Ray-lab v0.0.10
+X-Ray-lab v0.0.11
 PyQt5 + editable .ui files (open in Qt Designer).
 Color scheme from MolPlayer/constants.py (Laby.docx palette).
 """
@@ -150,7 +150,7 @@ def detect_dark_inclusion_regions(
     roi_mask: bytearray,
     contrast_threshold: Optional[int] = None,
 ) -> Tuple[bytearray, List[int]]:
-    """Detect compact dark Gaussian-like valleys and keep their half-depth area."""
+    """Detect dark valleys; draw half-depth regions but measure their dark cores."""
     width, height = grayscale.size
     scale = min(width, height)
     spot_radius = max(3, min(8, round(scale / 115)))
@@ -258,7 +258,20 @@ def detect_dark_inclusion_regions(
         if brighter_directions != 8 or fallen_directions < 7:
             continue
 
-        candidates.append({"peak": peak, "region": region, "area": len(region)})
+        # The half-depth contour is useful as a stable visual marker, but on an
+        # X-ray image it also contains the optical/detector blur around a grain.
+        # A deeper core is a better estimate of the particle cross-section used
+        # in the volume formula. 0.86 gives approximately half the half-depth
+        # diameter for a Gaussian point-spread profile.
+        measurement_area = sum(
+            response_pixels[x, y] >= peak * 0.86 for x, y in region
+        )
+        candidates.append({
+            "peak": peak,
+            "region": region,
+            "area": len(region),
+            "measurement_area": max(1, measurement_area),
+        })
 
     if not candidates:
         return bytearray(width * height), []
@@ -281,14 +294,11 @@ def detect_dark_inclusion_regions(
     mask = bytearray(width * height)
     areas: List[int] = []
     for candidate in selected:
-        unique_area = 0
         for x, y in candidate["region"]:
             index = y * width + x
             if not mask[index]:
                 mask[index] = 1
-                unique_area += 1
-        if unique_area:
-            areas.append(unique_area)
+        areas.append(candidate["measurement_area"])
     return mask, areas
 
 
@@ -299,8 +309,8 @@ def process_inclusions(
     contrast_threshold: Optional[int] = None,
 ) -> Tuple[Image.Image, Image.Image, int, List[int]]:
     """
-    Returns (original_rgb, processed_rgb, white_pixel_count_inside_mask,
-    connected_component_areas_px).
+    Returns (original_rgb, processed_rgb, measured_core_pixel_count,
+    measured_component_core_areas_px).
     Only dark local minima are considered. Each Gaussian-like valley is marked
     from its center to half of its local depth, then size outliers are removed.
     """
@@ -638,6 +648,23 @@ def calc_inclusion_volume_mm3(component_areas_mm2: List[float], incl_type: str) 
     return (4.0 / (3.0 * math.sqrt(math.pi))) * summed
 
 
+MAX_MEASUREMENT_MM = 9999.999
+
+
+def parse_measurement_mm(value: str) -> float:
+    """Parse a positive millimetre value with either comma or dot decimals."""
+    normalized = value.strip().replace(",", ".")
+    if not normalized:
+        return 0.0
+    try:
+        result = float(normalized)
+    except ValueError:
+        return 0.0
+    if not math.isfinite(result) or not (0 < result <= MAX_MEASUREMENT_MM):
+        return 0.0
+    return result
+
+
 def make_pen(color: str = "#00bfff", width: int = 3) -> QPen:
     pen = QPen(QColor(color))
     pen.setWidth(width)
@@ -700,6 +727,11 @@ class Lab1Window(QMainWindow):
 
         # Initial instruction
         self._update_instruction()
+
+        # Three-digit dimensions and decimal values such as 101 or 100,5 must
+        # be accepted in both measurement fields.
+        self.diamEdit.setMaxLength(8)
+        self.thickEdit.setMaxLength(8)
 
         self._restore_last_values()
 
@@ -774,10 +806,12 @@ class Lab1Window(QMainWindow):
     def _save_last_values(self):
         st = load_state()
         try:
-            if self.diamEdit.text().strip():
-                st["last_diam"] = int(self.diamEdit.text().strip())
-            if self.thickEdit.text().strip():
-                st["last_thick"] = int(self.thickEdit.text().strip())
+            diam = parse_measurement_mm(self.diamEdit.text())
+            thick = parse_measurement_mm(self.thickEdit.text())
+            if diam:
+                st["last_diam"] = f"{diam:g}"
+            if thick:
+                st["last_thick"] = f"{thick:g}"
             st["last_container"] = self._get_container_type()
             st["last_incl"] = "cubic" if self.cubicRadio.isChecked() else "sphere"
             save_state(st)
@@ -939,17 +973,14 @@ class Lab1Window(QMainWindow):
         diam_str = self.diamEdit.text().strip()
         thick_str = self.thickEdit.text().strip()
 
-        try:
-            real_size = float(diam_str) if diam_str else 0.0
-            thick = float(thick_str) if thick_str else 0.0
-        except ValueError:
-            real_size = 0.0
-            thick = 0.0
+        real_size = parse_measurement_mm(diam_str)
+        thick = parse_measurement_mm(thick_str)
 
-        if not has_line or real_size <= 0 or thick <= 0 or real_size > 99 or thick > 99:
+        if not has_line or real_size <= 0 or thick <= 0:
             QMessageBox.information(
                 self, "Недостаточно данных",
-                "Котик, не ходи мимо лотка и введи все требуемые данные для расчета"
+                "Проведите линию и введите размеры от 0,001 до 9999,999 мм. "
+                "Для дробной части можно использовать запятую или точку."
             )
             return
 
