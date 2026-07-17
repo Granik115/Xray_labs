@@ -1,5 +1,5 @@
 """
-X-Ray-lab v0.0.12
+X-Ray-lab v0.0.13
 PyQt5 + editable .ui files (open in Qt Designer).
 Color scheme from MolPlayer/constants.py (Laby.docx palette).
 """
@@ -155,7 +155,11 @@ def detect_dark_inclusion_regions(
     scale = min(width, height)
     spot_radius = max(3, min(8, round(scale / 115)))
     background_radius = max(4, min(14, round(scale / 80)))
-    nms_radius = spot_radius
+    # Search for separate maxima on a smaller neighbourhood than the particle
+    # diameter. A full-radius maximum filter erased the second peak when two
+    # 1 mm balls touched or slightly overlapped in projection.
+    local_max_radius = max(3, spot_radius // 2)
+    dedup_radius = spot_radius
     region_radius = max(7, spot_radius * 2 + 1)
     minimum_peak = contrast_threshold if contrast_threshold is not None else max(8, round(spot_radius * 2.5))
     strong_peak = max(24, minimum_peak * 3)
@@ -167,23 +171,28 @@ def detect_dark_inclusion_regions(
     smooth_pixels = smooth.load()
 
     roi_image = Image.frombytes("L", (width, height), bytes(roi_mask))
-    # The center may be close to a user-drawn ROI border, but the detected
-    # half-depth region itself must remain inside it.
-    boundary_margin = max(6, spot_radius * 2)
+    # The center may be close to a user-drawn ROI border; the grown marker is
+    # safely clipped to the ROI below.
+    # The user-drawn line is a calibration aid, not a hard exclusion band.
+    # Keep only a small safety margin so a grain whose centre is visibly inside
+    # the contour remains detectable even when the diameter was drawn roughly.
+    boundary_margin = max(2, spot_radius // 3)
     filter_size = boundary_margin * 2 + 1
     center_pixels = roi_image.filter(ImageFilter.MinFilter(filter_size)).load()
+    interior_size = spot_radius * 4 + 1
+    interior_pixels = roi_image.filter(ImageFilter.MinFilter(interior_size)).load()
     roi_pixels = roi_image.load()
 
     preliminary: List[Tuple[int, int, int]] = []
-    for y in range(nms_radius, height - nms_radius):
-        for x in range(nms_radius, width - nms_radius):
+    for y in range(local_max_radius, height - local_max_radius):
+        for x in range(local_max_radius, width - local_max_radius):
             peak = response_pixels[x, y]
             if peak < minimum_peak or not center_pixels[x, y]:
                 continue
             if any(
                 center_pixels[nx, ny] and response_pixels[nx, ny] > peak
-                for ny in range(y - nms_radius, y + nms_radius + 1)
-                for nx in range(x - nms_radius, x + nms_radius + 1)
+                for ny in range(y - local_max_radius, y + local_max_radius + 1)
+                for nx in range(x - local_max_radius, x + local_max_radius + 1)
             ):
                 continue
             preliminary.append((peak, x, y))
@@ -192,7 +201,7 @@ def detect_dark_inclusion_regions(
     peaks: List[Tuple[int, int, int]] = []
     for peak, x, y in preliminary:
         if any(
-            (x - other_x) ** 2 + (y - other_y) ** 2 <= nms_radius ** 2
+            (x - other_x) ** 2 + (y - other_y) ** 2 <= dedup_radius ** 2
             for _, other_x, other_y in peaks
         ):
             continue
@@ -231,10 +240,42 @@ def detect_dark_inclusion_regions(
         box_height = max(ys) - min(ys) + 1
         compactness = len(region) / (box_width * box_height)
         aspect_ratio = max(box_width, box_height) / min(box_width, box_height)
-        if compactness < 0.6 or aspect_ratio > 1.6:
+        near_roi_boundary = not interior_pixels[seed_x, seed_y]
+        region_points = set(region)
+        shares_region_with_peak = any(
+            (other_x, other_y) in region_points
+            and (other_x - seed_x) ** 2 + (other_y - seed_y) ** 2 > dedup_radius ** 2
+            for _, other_x, other_y in peaks
+        )
+        relaxed_shape = near_roi_boundary or shares_region_with_peak
+        minimum_compactness = 0.45 if relaxed_shape else 0.60
+        maximum_aspect_ratio = 2.40 if shares_region_with_peak else (
+            2.0 if near_roi_boundary else 1.60
+        )
+        if compactness < minimum_compactness or aspect_ratio > maximum_aspect_ratio:
             continue
 
         core_level = min(smooth_pixels[x, y] for x, y in region)
+        local_core_level = smooth_pixels[seed_x, seed_y]
+        local_delta = max(4, minimum_peak * 0.25)
+        local_samples = [
+            (seed_x + dx * spot_radius, seed_y + dy * spot_radius)
+            for dx, dy in (
+                (1, 0), (-1, 0), (0, 1), (0, -1),
+                (1, 1), (1, -1), (-1, 1), (-1, -1),
+            )
+            if 0 <= seed_x + dx * spot_radius < width
+            and 0 <= seed_y + dy * spot_radius < height
+        ]
+        local_brighter_directions = sum(
+            smooth_pixels[sample_x, sample_y] - local_core_level >= local_delta
+            for sample_x, sample_y in local_samples
+        )
+        # At particle scale a dark ball is surrounded by brighter pixels in
+        # almost every direction. A container edge is bright only across its
+        # normal and therefore cannot masquerade as a ball, even near the ROI.
+        if len(local_samples) < 7 or local_brighter_directions < 7:
+            continue
         sample_radius = max(7, max(box_width, box_height) + 3)
         minimum_surrounding_delta = max(5, minimum_peak * 0.5)
         brighter_directions = 0
@@ -267,6 +308,7 @@ def detect_dark_inclusion_regions(
         candidates.append({
             "peak": peak,
             "seed": (seed_x, seed_y),
+            "near_boundary": near_roi_boundary,
             "region": region,
             "area": len(region),
             "measurement_area": max(1, measurement_area),
@@ -275,27 +317,48 @@ def detect_dark_inclusion_regions(
     if not candidates:
         return bytearray(width * height), []
 
-    # A broad soft rim can produce several nearby maxima whose grown regions
-    # are essentially the same object. Keep only the strongest of substantially
-    # overlapping regions, without merging genuinely close particle pairs.
-    unique_candidates: List[dict] = []
-    occupied_regions: List[set] = []
+    # Keep neighbouring peaks only when the response between them rises far
+    # enough to form two separate dark valleys. This is the 1-D watershed test:
+    # touching balls have a pronounced saddle, while several maxima generated
+    # along one soft rim remain one feature.
+    distinct_candidates: List[dict] = []
     for candidate in sorted(candidates, key=lambda item: item["peak"], reverse=True):
-        region_set = set(candidate["region"])
-        if any(
-            len(region_set.intersection(other)) >= 0.25 * min(len(region_set), len(other))
-            for other in occupied_regions
-        ):
-            continue
-        unique_candidates.append(candidate)
-        occupied_regions.append(region_set)
-    candidates = unique_candidates
+        seed_x, seed_y = candidate["seed"]
+        duplicate = False
+        for other in distinct_candidates:
+            other_x, other_y = other["seed"]
+            distance = math.hypot(seed_x - other_x, seed_y - other_y)
+            if distance > spot_radius * 5:
+                continue
+            steps = max(1, math.ceil(distance))
+            saddle = min(
+                response_pixels[
+                    round(seed_x + (other_x - seed_x) * step / steps),
+                    round(seed_y + (other_y - seed_y) * step / steps),
+                ]
+                for step in range(steps + 1)
+            )
+            if saddle > min(candidate["peak"], other["peak"]) * 0.58:
+                duplicate = True
+                break
+        if not duplicate:
+            distinct_candidates.append(candidate)
+    candidates = distinct_candidates
 
     strong = [candidate for candidate in candidates if candidate["peak"] >= strong_peak]
     reference = strong if len(strong) >= 3 else sorted(
         candidates, key=lambda candidate: candidate["peak"], reverse=True
-    )[:min(10, len(candidates))]
-    typical_area = float(median(candidate["area"] for candidate in reference))
+    )[:min(16, len(candidates))]
+    reference_areas = sorted(candidate["area"] for candidate in reference)
+    # Edge gradients can yield as many broad candidates as real balls. Their
+    # regions are always larger, so estimate the equal-ball size from the lower
+    # 60% of plausible candidates instead of letting the rim inflate the median.
+    # The upper quartile of that cluster compensates for weak antialiased spots
+    # whose half-depth region is a little smaller than the visible ball.
+    lower_cluster_size = max(3, math.ceil(len(reference_areas) * 0.60))
+    size_reference = reference_areas[:min(lower_cluster_size, len(reference_areas))]
+    quartile_index = round((len(size_reference) - 1) * 0.75)
+    typical_area = float(size_reference[quartile_index])
 
     # Small speckles are still rejected tightly. A real grain touching the soft
     # circular rim may acquire a region up to about three times larger because
@@ -319,18 +382,19 @@ def detect_dark_inclusion_regions(
     normalised_measurement_area = max(1, round(typical_area * 1.15))
     typical_radius = math.sqrt(typical_area / math.pi)
     marker_radius_sq = (typical_radius * 1.18) ** 2
-    broad_seeds: List[Tuple[int, int]] = []
+    ordinary_peaks = [
+        candidate["peak"] for candidate in selected
+        if candidate["area"] <= ordinary_maximum_area
+    ]
+    typical_peak = float(median(ordinary_peaks)) if ordinary_peaks else float(minimum_peak)
     for candidate in selected:
         seed_x, seed_y = candidate["seed"]
         broad_rim_region = candidate["area"] > ordinary_maximum_area
-        if broad_rim_region and any(
-            (seed_x - other_x) ** 2 + (seed_y - other_y) ** 2
-            <= (typical_radius * 4.5) ** 2
-            for other_x, other_y in broad_seeds
-        ):
+        duplicate_rim_region = candidate["area"] > typical_area * 1.90
+        # A very broad edge response is accepted only when its darkness is
+        # consistent with the ordinary equal-intensity balls in this frame.
+        if duplicate_rim_region and candidate["peak"] < typical_peak * 0.85:
             continue
-        if broad_rim_region:
-            broad_seeds.append((seed_x, seed_y))
         for x, y in candidate["region"]:
             if broad_rim_region and (x - seed_x) ** 2 + (y - seed_y) ** 2 > marker_radius_sq:
                 continue

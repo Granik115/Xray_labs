@@ -40,8 +40,8 @@ class CoreLogicTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def test_version_comparison(self):
-        self.assertGreater(ver_tuple("v0.0.12"), ver_tuple("0.0.11"))
-        self.assertEqual(APP_VERSION, "0.0.12")
+        self.assertGreater(ver_tuple("v0.0.13"), ver_tuple("0.0.12"))
+        self.assertEqual(APP_VERSION, "0.0.13")
 
     def test_three_digit_and_decimal_measurements_are_accepted(self):
         self.assertEqual(parse_measurement_mm("101"), 101.0)
@@ -314,7 +314,7 @@ class CoreLogicTests(unittest.TestCase):
             (45, 45, 62, 2.1),
             (90, 45, 60, 2.1),
             (135, 45, 64, 2.1),
-            (90, 151, 58, 2.1),  # normal particle, 9 px from ROI border
+            (90, 158, 58, 2.1),  # normal particle, only 2 px from ROI border
             (120, 105, 58, 1.25),  # undersized noise with similar peak
         ]
         for y in range(height):
@@ -331,8 +331,34 @@ class CoreLogicTests(unittest.TestCase):
                 roi_mask[y * width + x] = 255
         mask, areas = detect_dark_inclusion_regions(image, roi_mask, contrast_threshold=8)
         self.assertEqual(len(areas), 4)
-        self.assertTrue(mask[151 * width + 90])
+        self.assertTrue(mask[158 * width + 90])
         self.assertFalse(mask[105 * width + 120])
+
+    def test_touching_particles_with_separate_valleys_are_not_merged(self):
+        width = height = 220
+        image = Image.new("L", (width, height))
+        pixels = image.load()
+        spots = [
+            (45, 45),
+            (110, 45),
+            (175, 45),
+            (105, 130),
+            (113, 130),  # a touching neighbour with a separate local valley
+        ]
+        for y in range(height):
+            for x in range(width):
+                value = 140.0
+                for center_x, center_y in spots:
+                    distance = (x - center_x) ** 2 + (y - center_y) ** 2
+                    value -= 60 * math.exp(-distance / (2 * 2.5 ** 2))
+                pixels[x, y] = max(0, min(255, round(value)))
+
+        _, overlay, _, areas = process_inclusions(
+            image, None, "square", contrast_threshold=8
+        )
+        self.assertEqual(len(areas), 5)
+        self.assertEqual(overlay.getpixel((105, 130)), (0, 191, 255))
+        self.assertEqual(overlay.getpixel((113, 130)), (0, 191, 255))
 
     def test_safe_extract_rejects_path_traversal(self):
         with tempfile.TemporaryDirectory() as temp:
