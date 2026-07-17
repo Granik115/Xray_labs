@@ -1,5 +1,5 @@
 """
-X-Ray-lab v0.0.11
+X-Ray-lab v0.0.12
 PyQt5 + editable .ui files (open in Qt Designer).
 Color scheme from MolPlayer/constants.py (Laby.docx palette).
 """
@@ -150,7 +150,7 @@ def detect_dark_inclusion_regions(
     roi_mask: bytearray,
     contrast_threshold: Optional[int] = None,
 ) -> Tuple[bytearray, List[int]]:
-    """Detect dark valleys; draw half-depth regions but measure their dark cores."""
+    """Detect locally dark, similarly sized inclusions on an uneven X-ray field."""
     width, height = grayscale.size
     scale = min(width, height)
     spot_radius = max(3, min(8, round(scale / 115)))
@@ -181,7 +181,7 @@ def detect_dark_inclusion_regions(
             if peak < minimum_peak or not center_pixels[x, y]:
                 continue
             if any(
-                response_pixels[nx, ny] > peak
+                center_pixels[nx, ny] and response_pixels[nx, ny] > peak
                 for ny in range(y - nms_radius, y + nms_radius + 1)
                 for nx in range(x - nms_radius, x + nms_radius + 1)
             ):
@@ -204,19 +204,11 @@ def detect_dark_inclusion_regions(
         queue = deque([(seed_x, seed_y)])
         seen = {(seed_x, seed_y)}
         region: List[Tuple[int, int]] = []
-        touches_roi_boundary = False
         while queue:
             x, y = queue.popleft()
             if response_pixels[x, y] < half_depth or not roi_pixels[x, y]:
                 continue
             region.append((x, y))
-            for border_x, border_y in (
-                (x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)
-            ):
-                if not (0 <= border_x < width and 0 <= border_y < height):
-                    touches_roi_boundary = True
-                elif not roi_pixels[border_x, border_y]:
-                    touches_roi_boundary = True
             for next_x, next_y in (
                 (x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)
             ):
@@ -227,7 +219,11 @@ def detect_dark_inclusion_regions(
                 seen.add((next_x, next_y))
                 queue.append((next_x, next_y))
 
-        if len(region) < 3 or touches_roi_boundary:
+        # A real grain can overlap the user-drawn ROI by a pixel or two (most
+        # often at the end of a cylinder diameter). Its centre has already
+        # passed the eroded-ROI test, so keep the clipped region for the same
+        # radial and size checks as every other candidate.
+        if len(region) < 3:
             continue
         xs = [x for x, _ in region]
         ys = [y for _, y in region]
@@ -255,19 +251,22 @@ def detect_dark_inclusion_regions(
                 brighter_directions += 1
             if response_pixels[sample_x, sample_y] <= peak * 0.55:
                 fallen_directions += 1
-        if brighter_directions != 8 or fallen_directions < 7:
+        # A neighbouring grain or the soft container rim can occupy one of the
+        # eight sampling directions. Requiring all eight directions to be
+        # brighter used to discard close pairs and real grains near the rim.
+        if brighter_directions < 7 or fallen_directions < 7:
             continue
 
-        # The half-depth contour is useful as a stable visual marker, but on an
-        # X-ray image it also contains the optical/detector blur around a grain.
-        # A deeper core is a better estimate of the particle cross-section used
-        # in the volume formula. 0.86 gives approximately half the half-depth
-        # diameter for a Gaussian point-spread profile.
+        # Small legacy images need a deeper contour because their point-spread
+        # blur occupies most of a grain. On the full-resolution detector images
+        # the half-depth (FWHM) contour is the physical 1 mm grain boundary.
+        measurement_fraction = max(0.50, 0.86 - 0.12 * (spot_radius - 4))
         measurement_area = sum(
-            response_pixels[x, y] >= peak * 0.86 for x, y in region
+            response_pixels[x, y] >= peak * measurement_fraction for x, y in region
         )
         candidates.append({
             "peak": peak,
+            "seed": (seed_x, seed_y),
             "region": region,
             "area": len(region),
             "measurement_area": max(1, measurement_area),
@@ -276,15 +275,35 @@ def detect_dark_inclusion_regions(
     if not candidates:
         return bytearray(width * height), []
 
+    # A broad soft rim can produce several nearby maxima whose grown regions
+    # are essentially the same object. Keep only the strongest of substantially
+    # overlapping regions, without merging genuinely close particle pairs.
+    unique_candidates: List[dict] = []
+    occupied_regions: List[set] = []
+    for candidate in sorted(candidates, key=lambda item: item["peak"], reverse=True):
+        region_set = set(candidate["region"])
+        if any(
+            len(region_set.intersection(other)) >= 0.25 * min(len(region_set), len(other))
+            for other in occupied_regions
+        ):
+            continue
+        unique_candidates.append(candidate)
+        occupied_regions.append(region_set)
+    candidates = unique_candidates
+
     strong = [candidate for candidate in candidates if candidate["peak"] >= strong_peak]
     reference = strong if len(strong) >= 3 else sorted(
         candidates, key=lambda candidate: candidate["peak"], reverse=True
     )[:min(10, len(candidates))]
     typical_area = float(median(candidate["area"] for candidate in reference))
 
-    # A 4..6 px particle around a typical 5 px diameter remains admissible.
+    # Small speckles are still rejected tightly. A real grain touching the soft
+    # circular rim may acquire a region up to about three times larger because
+    # both dark valleys join. It remains admissible, but its measured area and
+    # visual marker are normalised to the other equal-size grains below.
     minimum_area = typical_area * (0.80 ** 2)
-    maximum_area = typical_area * (1.28 ** 2)
+    ordinary_maximum_area = typical_area * (1.28 ** 2)
+    maximum_area = typical_area * 3.40
     selected = [
         candidate for candidate in candidates
         if minimum_area <= candidate["area"] <= maximum_area
@@ -293,12 +312,35 @@ def detect_dark_inclusion_regions(
 
     mask = bytearray(width * height)
     areas: List[int] = []
+    full_resolution = spot_radius >= 7
+    # Calibration against the real detector frames: FWHM slightly clips the
+    # antialiased edge, so restore that sub-pixel boundary before the sphere
+    # volume formula (area^(3/2)) is applied.
+    normalised_measurement_area = max(1, round(typical_area * 1.15))
+    typical_radius = math.sqrt(typical_area / math.pi)
+    marker_radius_sq = (typical_radius * 1.18) ** 2
+    broad_seeds: List[Tuple[int, int]] = []
     for candidate in selected:
+        seed_x, seed_y = candidate["seed"]
+        broad_rim_region = candidate["area"] > ordinary_maximum_area
+        if broad_rim_region and any(
+            (seed_x - other_x) ** 2 + (seed_y - other_y) ** 2
+            <= (typical_radius * 4.5) ** 2
+            for other_x, other_y in broad_seeds
+        ):
+            continue
+        if broad_rim_region:
+            broad_seeds.append((seed_x, seed_y))
         for x, y in candidate["region"]:
+            if broad_rim_region and (x - seed_x) ** 2 + (y - seed_y) ** 2 > marker_radius_sq:
+                continue
             index = y * width + x
             if not mask[index]:
                 mask[index] = 1
-        areas.append(candidate["measurement_area"])
+        areas.append(
+            normalised_measurement_area
+            if full_resolution else candidate["measurement_area"]
+        )
     return mask, areas
 
 
@@ -622,10 +664,26 @@ def build_silent_installer_batch(installer_path: str, app_executable: str) -> st
 setlocal
 set "INSTALLER={installer_q}"
 set "APP_EXE={executable_q}"
-start "" /wait "%INSTALLER%" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /SP- /LOG="%TEMP%\Xray_labs_update.log"
+set "UPDATE_LOG=%TEMP%\Xray_labs_update.log"
+set "ERROR_FILE=%TEMP%\Xray_labs_update_error.txt"
+del /f /q "%ERROR_FILE%" >nul 2>&1
+if not exist "%INSTALLER%" (
+    echo Installer file is missing: %INSTALLER% > "%ERROR_FILE%"
+    start "" "%APP_EXE%"
+    del "%~f0" >nul 2>&1
+    exit /b 2
+)
+:wait_for_app
+tasklist /FI "IMAGENAME eq Xray_labs.exe" 2>nul | find /I "Xray_labs.exe" >nul
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >nul
+    goto wait_for_app
+)
+"%INSTALLER%" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /SP- /LOG="%UPDATE_LOG%"
 set "RESULT=%ERRORLEVEL%"
 if not "%RESULT%"=="0" (
-    echo Installer exit code: %RESULT% > "%TEMP%\Xray_labs_update_error.txt"
+    echo Installer exit code: %RESULT% > "%ERROR_FILE%"
+    echo Details: %UPDATE_LOG% >> "%ERROR_FILE%"
     start "" "%APP_EXE%"
     del /f /q "%INSTALLER%" >nul 2>&1
     del "%~f0" >nul 2>&1
@@ -637,6 +695,22 @@ del "%~f0" >nul 2>&1
 '''
 
 
+def consume_update_error() -> str:
+    """Return a previous silent-installer error once, then remove its marker."""
+    error_path = Path(tempfile.gettempdir()) / "Xray_labs_update_error.txt"
+    try:
+        message = error_path.read_text(encoding="utf-8", errors="replace").strip()
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return ""
+    try:
+        error_path.unlink()
+    except OSError:
+        pass
+    return message
+
+
 def calc_inclusion_volume_mm3(component_areas_mm2: List[float], incl_type: str) -> float:
     """Volume from each connected inclusion area according to Laby.docx."""
     areas = [area for area in component_areas_mm2 if area > 0]
@@ -646,6 +720,31 @@ def calc_inclusion_volume_mm3(component_areas_mm2: List[float], incl_type: str) 
     if incl_type == "cubic":
         return summed
     return (4.0 / (3.0 * math.sqrt(math.pi))) * summed
+
+
+def measurement_scale_mm_per_px(
+    entered_size_mm: float, line_length_px: float, container_type: str
+) -> float:
+    """Scale from the drawn line: square input is side, line is its diagonal."""
+    if entered_size_mm <= 0 or line_length_px <= 0:
+        return 0.0
+    line_size_mm = (
+        entered_size_mm * math.sqrt(2.0)
+        if container_type == "square" else entered_size_mm
+    )
+    return line_size_mm / line_length_px
+
+
+def container_volume_mm3(
+    entered_size_mm: float, thickness_mm: float, container_type: str
+) -> float:
+    """Volume of a square cuvette (side) or cylindrical cuvette (diameter)."""
+    if entered_size_mm <= 0 or thickness_mm <= 0:
+        return 0.0
+    if container_type == "square":
+        return entered_size_mm ** 2 * thickness_mm
+    radius_mm = entered_size_mm / 2.0
+    return math.pi * radius_mm ** 2 * thickness_mm
 
 
 MAX_MEASUREMENT_MM = 9999.999
@@ -754,13 +853,13 @@ class Lab1Window(QMainWindow):
         if self._get_container_type() == "square":
             self.instructionLabel.setText(
                 "Укажите курсором мыши диагональ квадратного контейнера на снимке "
-                "и введите её параметры"
+                "и введите длину его стороны"
             )
-            self.diamLabel.setText("Диагональ")
+            self.diamLabel.setText("Сторона")
         else:
             self.instructionLabel.setText(
-                "Укажите курсором мыши диаметр цилиндрического контейнера на снимке "
-                "и введите его параметры"
+                "Проведите видимый диаметр цилиндрического контейнера через центр "
+                "по длинной оси и введите его размер"
             )
             self.diamLabel.setText("Диаметр")
 
@@ -992,8 +1091,9 @@ class Lab1Window(QMainWindow):
             return
 
         ctype = self._get_container_type()
-        # real_size: диагональ (квадрат) или диаметр (цилиндр) в мм
-        scale_mm_per_px = real_size / px_len
+        # Для квадрата пользователь вводит сторону, хотя на снимке по-прежнему
+        # проводит диагональ. Для цилиндра вводится и проводится диаметр.
+        scale_mm_per_px = measurement_scale_mm_per_px(real_size, px_len, ctype)
 
         signature = (self.line_points, ctype)
         if self._processed_signature != signature:
@@ -1003,12 +1103,7 @@ class Lab1Window(QMainWindow):
             area_px * (scale_mm_per_px ** 2) for area_px in self.component_px_areas
         ]
 
-        if ctype == "square":
-            side_mm = real_size / math.sqrt(2.0)
-            container_mm3 = side_mm * side_mm * thick
-        else:
-            r = real_size / 2.0
-            container_mm3 = math.pi * r * r * thick
+        container_mm3 = container_volume_mm3(real_size, thick, ctype)
 
         incl_type = "cubic" if self.cubicRadio.isChecked() else "sphere"
         incl_mm3 = calc_inclusion_volume_mm3(component_areas_mm2, incl_type)
@@ -1212,7 +1307,18 @@ class MainWindow(QMainWindow):
 
         self._lab_windows = []
         self._populate_lab_buttons()
+        QTimer.singleShot(1200, self._show_pending_update_error)
         QTimer.singleShot(8000, lambda: self._check_for_updates(silent=True))
+
+    def _show_pending_update_error(self):
+        message = consume_update_error()
+        if message and self.isVisible():
+            QMessageBox.warning(
+                self,
+                "Предыдущая установка не завершена",
+                "Тихая установка предыдущего обновления завершилась ошибкой:\n\n"
+                f"{message}\n\nПовторите обновление или запустите установщик из релиза.",
+            )
 
     def focusInEvent(self, event):
         super().focusInEvent(event)

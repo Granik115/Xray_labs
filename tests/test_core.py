@@ -16,10 +16,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from xray_app import (
     build_silent_installer_batch,
     calc_inclusion_volume_mm3,
+    container_volume_mm3,
+    consume_update_error,
     connected_component_areas,
     detect_dark_inclusion_regions,
     dismiss_update_progress,
     download_release_asset,
+    measurement_scale_mm_per_px,
     parse_measurement_mm,
     process_inclusions,
     safe_extract_zip,
@@ -37,8 +40,8 @@ class CoreLogicTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def test_version_comparison(self):
-        self.assertGreater(ver_tuple("v0.0.11"), ver_tuple("0.0.10"))
-        self.assertEqual(APP_VERSION, "0.0.11")
+        self.assertGreater(ver_tuple("v0.0.12"), ver_tuple("0.0.11"))
+        self.assertEqual(APP_VERSION, "0.0.12")
 
     def test_three_digit_and_decimal_measurements_are_accepted(self):
         self.assertEqual(parse_measurement_mm("101"), 101.0)
@@ -155,12 +158,40 @@ class CoreLogicTests(unittest.TestCase):
             "/SUPPRESSMSGBOXES",
             "/NORESTART",
             "/CLOSEAPPLICATIONS",
-            "/RESTARTAPPLICATIONS",
             "/SP-",
         ):
             self.assertIn(switch, script)
+        self.assertIn(":wait_for_app", script)
+        self.assertIn('"%INSTALLER%" /VERYSILENT', script)
+        self.assertNotIn("/RESTARTAPPLICATIONS", script)
         self.assertIn('start "" "%APP_EXE%"', script)
         self.assertIn("Installer exit code", script)
+
+    def test_silent_installer_error_is_reported_only_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "Xray_labs_update_error.txt"
+            marker.write_text("Installer exit code: 5", encoding="utf-8")
+            with patch("tempfile.gettempdir", return_value=temp):
+                self.assertEqual(consume_update_error(), "Installer exit code: 5")
+                self.assertEqual(consume_update_error(), "")
+
+    def test_square_input_is_side_but_drawn_line_is_diagonal(self):
+        self.assertAlmostEqual(
+            measurement_scale_mm_per_px(25.0, 100.0, "square"),
+            25.0 * math.sqrt(2.0) / 100.0,
+        )
+        self.assertAlmostEqual(
+            measurement_scale_mm_per_px(25.0, 100.0, "cylinder"), 0.25
+        )
+        self.assertAlmostEqual(container_volume_mm3(25.0, 10.0, "square"), 6250.0)
+        lab = Lab1Window()
+        try:
+            lab.squareRadio.setChecked(True)
+            lab._update_instruction()
+            self.assertEqual(lab.diamLabel.text(), "Сторона")
+            self.assertIn("диагональ", lab.instructionLabel.text().lower())
+        finally:
+            lab.close()
 
     def test_windows_are_opaque_and_version_button_is_not_duplicated(self):
         main = MainWindow()
@@ -209,6 +240,15 @@ class CoreLogicTests(unittest.TestCase):
         expected = 10 * math.pi * diameter ** 3 / 6.0
         self.assertAlmostEqual(actual, expected)
         self.assertLess(actual, 1.0)
+
+    def test_seven_to_eight_one_millimetre_spheres_are_about_four_cubic_mm(self):
+        cross_section = math.pi * 0.5 ** 2
+        seven = calc_inclusion_volume_mm3([cross_section] * 7, "sphere")
+        eight = calc_inclusion_volume_mm3([cross_section] * 8, "sphere")
+        self.assertAlmostEqual(seven, 7 * math.pi / 6.0)
+        self.assertAlmostEqual(eight, 8 * math.pi / 6.0)
+        self.assertLess(seven, 4.0)
+        self.assertGreater(eight, 4.0)
 
     def test_local_contrast_ignores_smooth_exposure_gradient(self):
         width = height = 100
